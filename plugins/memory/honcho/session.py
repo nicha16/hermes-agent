@@ -694,20 +694,101 @@ class HonchoSessionManager:
         with self._prefetch_cache_lock:
             return self._context_cache.pop(session_key, {})
 
+    def _repo_context_kwargs(self, session: HonchoSession, user_message: str | None = None) -> dict[str, Any]:
+        """Build bounded, query-aware ``session.context`` kwargs.
+
+        The auto-injected base context should be a scoped briefing for the
+        current turn, not Honcho's broad default global/session preamble. Keep
+        peer target/perspective explicit, preserve an explicit token budget, and
+        when there is a substantive current query ask Honcho for search-scoped
+        context with summaries disabled.
+        """
+        kwargs: dict[str, Any] = {
+            "peer_target": session.user_peer_id,
+            "peer_perspective": session.assistant_peer_id,
+        }
+        if self._context_tokens is not None:
+            kwargs["tokens"] = self._context_tokens
+        query = (user_message or "").strip()
+        if query:
+            kwargs.update({
+                "summary": False,
+                "search_query": query,
+                "search_top_k": 8,
+                "limit_to_session": True,
+                "max_conclusions": 12,
+            })
+        return kwargs
+
+    @staticmethod
+    def _ctx_text(value: Any) -> str:
+        """Return plain text from Honcho SDK fields, ignoring MagicMock-like noise."""
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        content = getattr(value, "content", None)
+        if isinstance(content, str):
+            return content
+        return ""
+
+    def _context_to_prefetch_result(self, ctx: Any) -> dict[str, str]:
+        """Normalize a Honcho session.context() response for prompt injection."""
+        result: dict[str, str] = {}
+        summary = self._ctx_text(getattr(ctx, "summary", None))
+        if summary:
+            result["summary"] = summary
+
+        representation = self._ctx_text(
+            getattr(ctx, "peer_representation", None)
+            or getattr(ctx, "representation", None)
+        )
+        if representation:
+            result["representation"] = representation
+
+        card = self._normalize_card(getattr(ctx, "peer_card", None))
+        if card:
+            result["card"] = "\n".join(card)
+        return result
+
+    def _fetch_repo_prefetch_context(
+        self,
+        honcho_session: Any,
+        session: HonchoSession,
+        user_message: str | None,
+    ) -> dict[str, str]:
+        """Fetch bounded targeted context via Honcho's documented session API."""
+        kwargs = self._repo_context_kwargs(session, user_message)
+        query_scope_keys = {"summary", "search_query", "search_top_k", "limit_to_session", "max_conclusions"}
+        try:
+            ctx = honcho_session.context(**kwargs)
+        except TypeError:
+            # Older Honcho SDK/server builds may not yet accept the query
+            # scoping knobs. Keep peer_perspective and token budgeting first;
+            # only strip perspective if that older compatibility path also
+            # fails.
+            fallback = {k: v for k, v in kwargs.items() if k not in query_scope_keys}
+            try:
+                ctx = honcho_session.context(**fallback)
+            except TypeError:
+                fallback.pop("peer_perspective", None)
+                ctx = honcho_session.context(**fallback)
+        return self._context_to_prefetch_result(ctx)
+
     def get_prefetch_context(self, session_key: str, user_message: str | None = None) -> dict[str, str]:
         """
         Pre-fetch user and AI peer context from Honcho.
 
-        Fetches peer_representation and peer_card for both peers, plus the
-        session summary when available. When user_message is provided, it is
-        passed as search_query to the peer context call so Honcho returns
-        conclusions relevant to the session topic rather than the full
-        observation dump.
+        Uses Honcho's documented ``session.context(...)`` primitive with
+        ``peer_target`` = the user peer and ``peer_perspective`` = the assistant
+        peer when available. When a current user message is available, Hermes
+        passes query and session-scoping controls so auto-injected context
+        follows the live turn instead of Honcho's broad default preamble.
+        Falls back to the peer APIs for older SDK/server builds.
 
         Args:
             session_key: The session key to get context for.
-            user_message: Optional first user message used as search_query for
-                          topic-relevant context retrieval.
+            user_message: Current turn text used to scope context retrieval.
 
         Returns:
             Dictionary with 'representation', 'card', 'ai_representation',
@@ -717,6 +798,15 @@ class HonchoSessionManager:
         if not session:
             return {}
 
+        honcho_session = self._sessions_cache.get(session.honcho_session_id)
+        if honcho_session:
+            try:
+                repo_result = self._fetch_repo_prefetch_context(honcho_session, session, user_message)
+                if repo_result:
+                    return repo_result
+            except Exception as e:
+                logger.debug("Failed to fetch query-aware session context from Honcho: %s", e)
+
         result: dict[str, str] = {}
 
         # Session summary — provides session-scoped context.
@@ -724,7 +814,6 @@ class HonchoSessionManager:
         # return null summary — the guard below handles that gracefully.
         # Per-directory returning sessions get their accumulated summary.
         try:
-            honcho_session = self._sessions_cache.get(session.honcho_session_id)
             if honcho_session:
                 ctx = honcho_session.context(summary=True)
                 if ctx.summary and getattr(ctx.summary, "content", None):
