@@ -297,7 +297,58 @@ class TestPeerLookupHelpers:
             search_query="assistant",
         )
 
-    def test_get_prefetch_context_fetches_user_and_ai_from_peer_api(self):
+    def test_get_prefetch_context_uses_query_aware_session_context_when_available(self):
+        mgr, session = self._make_cached_manager()
+        mgr._context_tokens = 640
+        honcho_session = MagicMock()
+        honcho_session.context.return_value = SimpleNamespace(
+            summary=SimpleNamespace(content="Session summary"),
+            peer_representation="User representation",
+            peer_card=["Name: Robert"],
+        )
+        mgr._sessions_cache[session.honcho_session_id] = honcho_session
+
+        result = mgr.get_prefetch_context(session.key, user_message="What is the Danista open question?")
+
+        assert result == {
+            "summary": "Session summary",
+            "representation": "User representation",
+            "card": "Name: Robert",
+        }
+        honcho_session.context.assert_called_once_with(
+            peer_target=session.user_peer_id,
+            peer_perspective=session.assistant_peer_id,
+            tokens=640,
+            summary=False,
+            search_query="What is the Danista open question?",
+            search_top_k=8,
+            limit_to_session=True,
+            max_conclusions=12,
+        )
+
+    def test_get_prefetch_context_falls_back_when_query_kwargs_unsupported(self):
+        mgr, session = self._make_cached_manager()
+        honcho_session = MagicMock()
+        honcho_session.context.side_effect = [
+            TypeError("unexpected keyword argument 'search_query'"),
+            SimpleNamespace(
+                summary=SimpleNamespace(content="Fallback summary"),
+                peer_representation="Fallback representation",
+                peer_card=["Name: Robert"],
+            ),
+        ]
+        mgr._sessions_cache[session.honcho_session_id] = honcho_session
+
+        result = mgr.get_prefetch_context(session.key, user_message="What is the Danista open question?")
+
+        assert result["summary"] == "Fallback summary"
+        assert result["representation"] == "Fallback representation"
+        assert honcho_session.context.call_args_list[1].kwargs == {
+            "peer_target": session.user_peer_id,
+            "peer_perspective": session.assistant_peer_id,
+        }
+
+    def test_get_prefetch_context_fallback_fetches_user_only_from_peer_api(self):
         mgr, session = self._make_cached_manager()
         user_peer = MagicMock()
         user_peer.context.return_value = SimpleNamespace(

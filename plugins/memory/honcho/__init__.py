@@ -204,6 +204,15 @@ class HonchoMemoryProvider(MemoryProvider):
             pass
         return paths
 
+    # Authority-gated auto-context should stay a compact briefing, not a raw
+    # transcript or global biography preamble. Raw Honcho context remains
+    # available through tools when the task explicitly asks for it.
+    _AUTHORITY_LINE_MAX_CHARS = 280
+    _AUTHORITY_BRIEF_MAX_CHARS = 2400
+    _AUTHORITY_STANDING_LIMIT = 6
+    _AUTHORITY_ADJACENT_LIMIT = 4
+    _AUTHORITY_SITUATION_LIMIT = 6
+
     def __init__(self):
         self._manager = None   # HonchoSessionManager
         self._config = None    # HonchoClientConfig
@@ -247,6 +256,11 @@ class HonchoMemoryProvider(MemoryProvider):
 
         # Port #4053: cron guard — when True, plugin is fully inactive
         self._cron_skipped = False
+
+        # Feature flag: compile raw Honcho base context into authority lanes
+        # before automatic prompt injection. Raw Honcho remains available via
+        # tools; this only changes the auto-injected <memory-context> shape.
+        self._active_context_gate = False
 
     @property
     def name(self) -> str:
@@ -336,6 +350,12 @@ class HonchoMemoryProvider(MemoryProvider):
                 self._reasoning_heuristic = cfg.reasoning_heuristic
                 if cfg.reasoning_level_cap in self._LEVEL_ORDER:
                     self._reasoning_level_cap = cfg.reasoning_level_cap
+                host_block = (raw.get("hosts") or {}).get(cfg.host, {})
+                self._active_context_gate = self._resolve_bool_config(
+                    host_block.get("activeContextGate"),
+                    raw.get("activeContextGate"),
+                    default=False,
+                )
             except Exception as e:
                 logger.debug("Honcho cost-awareness config parse error: %s", e)
 
@@ -559,8 +579,11 @@ class HonchoMemoryProvider(MemoryProvider):
             return True
         return not (self._init_thread and self._init_thread.is_alive())
 
-    def _format_first_turn_context(self, ctx: dict) -> str:
+    def _format_first_turn_context(self, ctx: dict, query: str | None = None) -> str:
         """Format the prefetch context dict into a readable system prompt block."""
+        if self._active_context_gate:
+            return self._format_authority_scoped_context(ctx, query=query)
+
         parts = []
 
         # Session summary — session-scoped context, placed first for relevance
@@ -587,6 +610,220 @@ class HonchoMemoryProvider(MemoryProvider):
         if not parts:
             return ""
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _resolve_bool_config(primary: Any, secondary: Any = None, *, default: bool = False) -> bool:
+        """Resolve a bool-ish config value with primary > secondary > default."""
+        for value in (primary, secondary):
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in {"1", "true", "yes", "on", "enabled"}:
+                    return True
+                if lowered in {"0", "false", "no", "off", "disabled"}:
+                    return False
+            return bool(value)
+        return default
+
+    @staticmethod
+    def _clean_authority_line(line: str) -> str:
+        """Normalize a recalled line before it becomes prompt context."""
+        line = re.sub(r"^\s*(?:[-*•]+|\d+[.)])\s*", "", line).strip()
+        line = re.sub(r"\bprior memory file says\b:?\s*", "", line, flags=re.IGNORECASE)
+        line = re.sub(r"https?://\S+", "[redacted-link]", line)
+        line = re.sub(r"\b-?\d{7,}\b", "[redacted-id]", line)
+        return line.strip()
+
+    @classmethod
+    def _truncate_authority_line(cls, line: str) -> str:
+        """Keep admitted bullets compact enough for prompt injection."""
+        if len(line) <= cls._AUTHORITY_LINE_MAX_CHARS:
+            return line
+        cut = line[: cls._AUTHORITY_LINE_MAX_CHARS]
+        boundary = max(cut.rfind(". "), cut.rfind("; "), cut.rfind(", "), cut.rfind(" "))
+        if boundary > cls._AUTHORITY_LINE_MAX_CHARS * 0.55:
+            cut = cut[:boundary]
+        return cut.rstrip(" .,;") + " …"
+
+    @staticmethod
+    def _is_low_authority_narrative_line(line: str) -> bool:
+        """Detect recalled story/history that must not become standing policy."""
+        return bool(re.search(
+            r"\b(keira then|nicha then|keira (?:said|reported|recommended|admitted|checked|looked)|"
+            r"nicha (?:asked|observed|pressed|said|clarified|confirmed)|"
+            r"the conversation (?:also )?covered|a related .* emerged|this shifted the diagnosis|"
+            r"after nicha|when nicha|old session summary|debugging narrative|prior operator decisions|"
+            r"most relevant active context|immediate thread context)\b",
+            line,
+            re.IGNORECASE,
+        ))
+
+    @staticmethod
+    def _matches_standing_kernel(line: str) -> bool:
+        """Strict whitelist for durable operating policy bullets."""
+        if HonchoMemoryProvider._is_low_authority_narrative_line(line):
+            return False
+        return bool(re.search(
+            r"^(?:grounding|approval boundaries?|approval|privacy|security|memory|routing|domains?|"
+            r"wiki/session recall|source hierarchy|current .*stale|pa style|communication style)\b|"
+            r"\b(before live writes?|before live restarts|do not expose secrets?|credentials?|"
+            r"current explicit user instruction|live source evidence|wiki/session recall|"
+            r"proactively search wiki/session)\b",
+            line,
+            re.IGNORECASE,
+        ))
+
+    @classmethod
+    def _cap_authority_brief(cls, text: str) -> str:
+        """Hard cap the auto-injected memory brief even if upstream is noisy."""
+        if len(text) <= cls._AUTHORITY_BRIEF_MAX_CHARS:
+            return text
+        cut = text[: cls._AUTHORITY_BRIEF_MAX_CHARS]
+        boundary = max(cut.rfind("\n### "), cut.rfind("\n- "), cut.rfind("\n"))
+        if boundary > cls._AUTHORITY_BRIEF_MAX_CHARS * 0.65:
+            cut = cut[:boundary]
+        return cut.rstrip() + " …"
+
+    @staticmethod
+    def _context_lines(ctx: dict) -> list[str]:
+        """Flatten Honcho context fields into candidate lines without section labels."""
+        lines: list[str] = []
+        for key in ("card", "summary", "representation", "ai_card", "ai_representation"):
+            value = ctx.get(key, "")
+            if not value:
+                continue
+            for raw_line in str(value).splitlines():
+                cleaned = HonchoMemoryProvider._clean_authority_line(raw_line)
+                if cleaned:
+                    lines.append(cleaned)
+        return lines
+
+    @staticmethod
+    def _query_terms(query: str | None) -> set[str]:
+        if not query:
+            return set()
+        return {
+            token.lower()
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{3,}", query)
+            if token.lower() not in {
+                "this", "that", "with", "from", "what", "when", "where", "have", "about",
+                "your", "current", "please", "would", "could", "should", "there", "their",
+            }
+        }
+
+    @staticmethod
+    def _needs_canonical_recall(query: str | None) -> bool:
+        if not query:
+            return False
+        q = query.lower()
+        if re.search(r"\b(open question|open loop|still open|answered|unanswered|what happened|what did we decide|what did i ask|what was decided)\b", q):
+            return True
+        # Capitalized named entity plus continuity wording, e.g. "Danista open question".
+        if re.search(r"\b[A-Z][A-Za-z0-9_-]{3,}\b", query) and re.search(r"\b(question|status|state|decision|decide|left|remaining|next)\b", q):
+            return True
+        return False
+
+    @staticmethod
+    def _dedupe_keep_order(lines: list[str], *, limit: int = 8) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for line in lines:
+            key = re.sub(r"\s+", " ", line).strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(line)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _format_authority_scoped_context(self, ctx: dict, query: str | None = None) -> str:
+        """Compile raw Honcho base context into authority-scoped prompt lanes.
+
+        This is a forward-prevention layer: it preserves useful PA context and
+        standing policies while keeping raw observations, task diaries, and
+        unrelated workflow schemas searchable through Honcho tools instead of
+        auto-injecting them as instruction-grade context.
+        """
+        query_l = (query or "").lower()
+        query_terms = self._query_terms(query)
+        standing: list[str] = []
+        adjacent: list[str] = []
+        situation: list[str] = []
+        quarantine_count = 0
+
+        pa_re = re.compile(r"\b(rich pa|lookaround|look around|adjacent context|chief of staff|front door)\b", re.IGNORECASE)
+        workflow_re = re.compile(
+            r"\b(whatsapp|json only|priority/summary/action|action_needed|draft_reply|"
+            r"random third-party|luggage|debug diary|old service|user said|user asked|"
+            r"\bdo it\b|\bnext step\b|meeting link|chat id)\b",
+            re.IGNORECASE,
+        )
+
+        for line in self._context_lines(ctx):
+            lower = line.lower()
+            if self._is_low_authority_narrative_line(line):
+                quarantine_count += 1
+                continue
+            admitted = self._truncate_authority_line(line)
+            if self._matches_standing_kernel(line):
+                standing.append(admitted)
+                continue
+            if pa_re.search(line):
+                adjacent.append(admitted)
+                continue
+            if workflow_re.search(line):
+                # Task/workflow residue stays searchable but should not frame
+                # unrelated current turns.
+                if "whatsapp" in lower and "whatsapp" in query_l:
+                    situation.append(admitted)
+                else:
+                    quarantine_count += 1
+                continue
+            if query_terms and any(term in lower for term in query_terms):
+                situation.append(admitted)
+            else:
+                quarantine_count += 1
+
+        standing = self._dedupe_keep_order(standing, limit=self._AUTHORITY_STANDING_LIMIT)
+        adjacent = self._dedupe_keep_order(adjacent, limit=self._AUTHORITY_ADJACENT_LIMIT)
+        situation = self._dedupe_keep_order(situation, limit=self._AUTHORITY_SITUATION_LIMIT)
+
+        parts = [
+            "## PA Situation Brief",
+            "Honcho auto-context is authority-scoped background. Current user message, live sources, and canonical wiki/session evidence outrank recalled context.",
+        ]
+        if standing:
+            parts.append("### Standing operating kernel\n" + "\n".join(f"- {line}" for line in standing))
+        if adjacent:
+            parts.append("### Adjacent PA context — scoped lookaround\n" + "\n".join(f"- {line}" for line in adjacent))
+        if situation:
+            parts.append("### Situation-specific recalled context\n" + "\n".join(f"- {line}" for line in situation))
+        if self._needs_canonical_recall(query):
+            parts.append(
+                "### Canonical recall trigger\n"
+                "- Named project/entity/open-loop wording detected; search wiki/session before answering and synthesize answered-vs-open residuals from current provenance."
+            )
+        if quarantine_count:
+            parts.append(
+                "### Quarantined recalled context\n"
+                f"- {quarantine_count} low-authority/stale Honcho line(s) withheld from automatic prompt context; use Honcho tools only if the current task explicitly activates them."
+            )
+
+        if len(parts) <= 2:
+            return ""
+        return self._cap_authority_brief("\n\n".join(parts))
+
+    def _format_dialectic_context(self, text: str, query: str | None = None) -> str:
+        """Gate Honcho dialectic/active-context supplement before injection."""
+        if not text or not text.strip():
+            return ""
+        if not self._active_context_gate:
+            return text
+        return self._format_authority_scoped_context({"summary": text}, query=query)
 
     def system_prompt_block(self) -> str:
         """Return system prompt text, adapted by recall_mode.
@@ -683,7 +920,7 @@ class HonchoMemoryProvider(MemoryProvider):
         if self._manager:
             fresh_ctx = self._manager.pop_context_result(self._session_key)
             if fresh_ctx:
-                formatted = self._format_first_turn_context(fresh_ctx)
+                formatted = self._format_first_turn_context(fresh_ctx, query=query)
                 if formatted:
                     with self._base_context_lock:
                         self._base_context_cache = formatted
@@ -765,7 +1002,9 @@ class HonchoMemoryProvider(MemoryProvider):
             dialectic_result = ""
 
         if dialectic_result and dialectic_result.strip():
-            parts.append(dialectic_result)
+            dialectic_context = self._format_dialectic_context(dialectic_result, query=query)
+            if dialectic_context:
+                parts.append(dialectic_context)
 
         if not parts:
             return ""
