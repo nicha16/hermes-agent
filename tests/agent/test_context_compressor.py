@@ -604,7 +604,7 @@ class TestNonStringContent:
 
 
 class TestSummaryFailureCooldown:
-    def test_summary_failure_enters_cooldown_and_skips_retry(self):
+    def test_summary_failure_uses_local_extractive_fallback(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
@@ -614,11 +614,13 @@ class TestSummaryFailureCooldown:
         ]
 
         with patch("agent.context_compressor.call_llm", side_effect=Exception("boom")) as mock_call:
-            first = c._generate_summary(messages)
-            second = c._generate_summary(messages)
+            result = c._generate_summary(messages)
 
-        assert first is None
-        assert second is None
+        assert result is not None
+        assert result.startswith(SUMMARY_PREFIX)
+        assert "deterministic local extractive checkpoint" in result
+        assert "do something" in result
+        assert c._last_summary_error is None
         assert mock_call.call_count == 1
 
 
@@ -871,9 +873,11 @@ class TestSummaryFallbackToMainModel:
         ) as mock_call:
             result = c._generate_summary(self._msgs())
 
-        # Only one attempt — retry gate blocks fallback when models match
+        # Only one provider attempt — retry gate blocks fallback when models match,
+        # then local extractive fallback preserves context.
         assert mock_call.call_count == 1
-        assert result is None
+        assert result is not None
+        assert "deterministic local extractive checkpoint" in result
         # Not flagged as fallen back — the retry condition was never met
         assert getattr(c, "_summary_model_fallen_back", False) is False
 
@@ -898,7 +902,8 @@ class TestSummaryFallbackToMainModel:
 
         # Exactly 2 calls: initial + one retry on main.  No further retries.
         assert mock_call.call_count == 2
-        assert result is None
+        assert result is not None
+        assert "deterministic local extractive checkpoint" in result
         assert c._summary_model_fallen_back is True
 
     def test_json_decode_error_falls_back_to_main_and_succeeds(self):
@@ -973,11 +978,9 @@ class TestSummaryFallbackToMainModel:
         assert result is not None
         assert "summary via main model" in result
 
-    def test_json_decode_error_on_main_uses_short_cooldown(self):
-        """When already on the main model (no separate summary_model, or
-        fallback already happened), a JSONDecodeError should set the short
-        30s cooldown, not the default 60s — provider bodies tend to
-        recover quickly when an upstream proxy comes back online."""
+    def test_json_decode_error_on_main_uses_local_extractive_fallback(self):
+        """When already on the main model, a JSONDecodeError should preserve
+        compacted context locally instead of inserting an information-free marker."""
         import json as _json
 
         err_json = _json.JSONDecodeError("Expecting value", "<html/>", 0)
@@ -995,9 +998,10 @@ class TestSummaryFallbackToMainModel:
         ), patch("agent.context_compressor.time.monotonic", return_value=1000.0):
             result = c._generate_summary(self._msgs())
 
-        assert result is None
-        # Short JSON-decode cooldown is 30s, not the default 60s.
-        assert c._summary_failure_cooldown_until == 1030.0
+        assert result is not None
+        assert "deterministic local extractive checkpoint" in result
+        assert c._summary_failure_cooldown_until == 0.0
+        assert c._last_summary_error is None
 
 
 class TestStreamingClosedFallback:
@@ -1076,9 +1080,9 @@ class TestStreamingClosedFallback:
         assert mock_call.call_count == 2
         assert result is not None
 
-    def test_streaming_closed_on_main_uses_short_cooldown(self):
-        """When already on the main model, a streaming-closed error should use
-        the 30s cooldown, not the default 60s — these errors are transient."""
+    def test_streaming_closed_on_main_uses_local_extractive_fallback(self):
+        """When already on the main model, a streaming-closed error should
+        preserve compacted context locally instead of inserting a marker."""
         err = Exception("RemoteProtocolError: response ended prematurely")
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
@@ -1097,13 +1101,14 @@ class TestStreamingClosedFallback:
         ), patch("agent.context_compressor.time.monotonic", return_value=1000.0):
             result = c._generate_summary(self._msgs())
 
-        assert result is None
-        # Streaming-closed should use the 30s short cooldown.
-        assert c._summary_failure_cooldown_until == 1030.0
+        assert result is not None
+        assert "deterministic local extractive checkpoint" in result
+        assert c._summary_failure_cooldown_until == 0.0
+        assert c._last_summary_error is None
 
-    def test_non_streaming_unknown_error_still_uses_long_cooldown(self):
-        """Unclassified errors should retain the 60s default cooldown to
-        prevent hammering a broken provider."""
+    def test_non_streaming_unknown_error_uses_local_extractive_fallback(self):
+        """Unclassified errors should still preserve compacted context via the
+        local extractive fallback."""
         err = Exception("Internal Server Error: something unexpected happened")
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
@@ -1121,8 +1126,10 @@ class TestStreamingClosedFallback:
         ), patch("agent.context_compressor.time.monotonic", return_value=1000.0):
             result = c._generate_summary(self._msgs())
 
-        assert result is None
-        assert c._summary_failure_cooldown_until == 1060.0
+        assert result is not None
+        assert "deterministic local extractive checkpoint" in result
+        assert c._summary_failure_cooldown_until == 0.0
+        assert c._last_summary_error is None
 
 
 class TestAuxModelFallbackSurfacedToCallers:
@@ -1217,12 +1224,11 @@ class TestAuxModelFallbackSurfacedToCallers:
 
 
 class TestSummaryFailureTrackingForGatewayWarning:
-    """Default behavior (compression.abort_on_summary_failure=False):
-    summary-generation failure inserts a static fallback placeholder and
-    records dropped count + fallback flag so gateway hygiene & /compress
-    can surface a visible warning."""
+    """When provider-backed summary generation fails, the compressor should
+    preserve local extractive context instead of inserting a marker that forces
+    gateway hygiene & /compress to warn about lost messages."""
 
-    def test_compress_records_fallback_and_dropped_count_on_summary_failure(self):
+    def test_compress_uses_extractive_summary_without_dropped_marker_on_summary_failure(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
@@ -1237,15 +1243,22 @@ class TestSummaryFailureTrackingForGatewayWarning:
             {"role": "user", "content": "msg 7"},
         ]
 
+        # Simulate summary LLM call failing when there is no separate aux model
+        # to retry against.
         with patch("agent.context_compressor.call_llm", side_effect=Exception("404 model not found")):
             result = c.compress(msgs)
 
-        assert c._last_summary_fallback_used is True
-        assert c._last_summary_dropped_count > 0
-        assert c._last_summary_error is not None
-        # Default mode: abort flag must NOT fire.
-        assert c._last_compress_aborted is False
+        assert c._last_summary_fallback_used is False
+        assert c._last_summary_dropped_count == 0
+        assert c._last_summary_error is None
+        # Result must still be well-formed (local extractive summary present,
+        # not the old information-free placeholder).
         assert any(
+            isinstance(m.get("content"), str)
+            and "deterministic local extractive checkpoint" in m["content"]
+            for m in result
+        )
+        assert not any(
             isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
             for m in result
         )
@@ -1386,11 +1399,12 @@ class TestSummaryFailureTrackingForGatewayWarning:
             {"role": "user", "content": "msg 7"},
         ]
 
+        # First call fails but is handled locally; second succeeds — the old
+        # marker-style fallback flags must remain clear.
         with patch("agent.context_compressor.call_llm", side_effect=Exception("boom")):
             c.compress(msgs)
-        assert c._last_summary_fallback_used is True
+        assert c._last_summary_fallback_used is False
 
-        c._summary_failure_cooldown_until = 0.0
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
             c.compress(msgs)
         assert c._last_summary_fallback_used is False

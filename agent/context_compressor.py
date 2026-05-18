@@ -1552,6 +1552,162 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
+    _EXTRACTIVE_FALLBACK_MAX_CHARS = 12_000
+    _EXTRACTIVE_FALLBACK_EVENT_LIMIT = 32
+
+    @staticmethod
+    def _shorten_for_extractive_summary(text: Any, limit: int = 500) -> str:
+        rendered = _content_text_for_contains(text).strip()
+        rendered = re.sub(r"\s+", " ", rendered)
+        if len(rendered) > limit:
+            return rendered[: limit - 20].rstrip() + " … " + rendered[-15:].lstrip()
+        return rendered
+
+    @staticmethod
+    def _extract_paths(text: str, limit: int = 20) -> list[str]:
+        paths: list[str] = []
+        seen: set[str] = set()
+        for match in re.finditer(r"(?:/|~/?|\./|\.\./)[A-Za-z0-9._@%+=:,/\\-]+", text or ""):
+            value = match.group(0).rstrip(".,;:)]}'\"")
+            if value and value not in seen:
+                seen.add(value)
+                paths.append(value)
+                if len(paths) >= limit:
+                    break
+        return paths
+
+    def _generate_extractive_fallback_summary(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        *,
+        reason: str | None = None,
+    ) -> str:
+        """Create a deterministic local summary when the summary LLM fails.
+
+        This is intentionally extractive, not clever: preserve recent user asks,
+        tool calls/results, paths, and error-looking lines so compression never
+        replaces a large middle section with an information-free marker just
+        because the auxiliary provider closed a stream.
+        """
+        events: list[str] = []
+        user_asks: list[str] = []
+        tool_events: list[str] = []
+        error_events: list[str] = []
+        all_text_parts: list[str] = []
+
+        def _append_event(line: str) -> None:
+            line = redact_sensitive_text(line.strip())
+            if line:
+                events.append(line)
+
+        for msg in turns_to_summarize:
+            role = msg.get("role", "unknown")
+            content = redact_sensitive_text(self._shorten_for_extractive_summary(msg.get("content"), 700))
+            if content:
+                all_text_parts.append(content)
+            lower = content.lower()
+            if any(marker in lower for marker in ("error", "failed", "traceback", "exception", "timeout", "blocked")):
+                error_events.append(f"{role}: {content}")
+
+            if role == "user" and content:
+                user_asks.append(content)
+                _append_event(f"USER: {content}")
+                continue
+
+            if role == "assistant":
+                tool_calls = msg.get("tool_calls") or []
+                if tool_calls:
+                    names: list[str] = []
+                    for tc in tool_calls:
+                        if isinstance(tc, dict):
+                            fn = tc.get("function", {})
+                            name = fn.get("name", "?")
+                            args = redact_sensitive_text(fn.get("arguments", ""))
+                            if len(args) > 240:
+                                args = args[:220].rstrip() + "..."
+                            names.append(f"{name}({args})" if args else name)
+                        else:
+                            fn = getattr(tc, "function", None)
+                            names.append(getattr(fn, "name", "?") if fn else "?")
+                    event = "ASSISTANT TOOL CALLS: " + "; ".join(names[:6])
+                    tool_events.append(event)
+                    _append_event(event)
+                elif content:
+                    _append_event(f"ASSISTANT: {content}")
+                continue
+
+            if role == "tool":
+                tool_id = msg.get("tool_call_id", "?")
+                event = f"TOOL RESULT {tool_id}: {content or '[no text content]'}"
+                tool_events.append(event)
+                _append_event(event)
+                continue
+
+            if content:
+                _append_event(f"{role.upper()}: {content}")
+
+        recent_events = events[-self._EXTRACTIVE_FALLBACK_EVENT_LIMIT:]
+        combined_text = "\n".join(all_text_parts + tool_events + error_events)
+        paths = self._extract_paths(combined_text)
+
+        active_task = user_asks[-1] if user_asks else "None."
+        completed = recent_events or ["No structured events were available in the compacted span."]
+        completed_lines = "\n".join(
+            f"{idx}. {line}" for idx, line in enumerate(completed, start=1)
+        )
+        file_lines = "\n".join(f"- `{path}`" for path in paths) if paths else "None detected in compacted span."
+        blocker_lines = "\n".join(f"- {line}" for line in error_events[-8:]) if error_events else "None detected in compacted span."
+        note = (
+            "The LLM summarizer was unavailable, so this is a deterministic local "
+            "extractive checkpoint from the compacted turns."
+        )
+        if reason:
+            note += f" Provider error was: {reason}."
+
+        body = f"""## Active Task
+{active_task}
+
+## Goal
+Preserve continuity from the compacted conversation span.
+
+## Constraints & Preferences
+{note}
+
+## Completed Actions
+{completed_lines}
+
+## Active State
+Current live state must be re-read from files, logs, services, or tools before making stateful claims.
+
+## In Progress
+Unknown from local extraction; use the latest protected tail messages and live state as authority.
+
+## Blocked
+{blocker_lines}
+
+## Key Decisions
+Not reliably inferable from local extraction.
+
+## Resolved Questions
+Not reliably inferable from local extraction.
+
+## Pending User Asks
+{active_task}
+
+## Relevant Files
+{file_lines}
+
+## Remaining Work
+Continue from the latest protected tail messages after this summary; verify live state before mutating anything.
+
+## Critical Context
+This summary was generated locally because provider-backed context summarization failed. It is extractive and partial, but it preserves recent user/tool/error/path signals instead of dropping the compacted span entirely."""
+        body = redact_sensitive_text(body)
+        if len(body) > self._EXTRACTIVE_FALLBACK_MAX_CHARS:
+            body = body[: self._EXTRACTIVE_FALLBACK_MAX_CHARS].rstrip() + "\n...[local extractive summary truncated]"
+        self._previous_summary = body
+        return self._with_summary_prefix(body)
+
     def _generate_summary(
         self,
         turns_to_summarize: List[Dict[str, Any]],
@@ -1570,9 +1726,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 related to this topic and is more aggressive about compressing
                 everything else.  Inspired by Claude Code's ``/compact``.
 
-        Returns None if all attempts fail — the caller should drop
-        the middle turns without a summary rather than inject a useless
-        placeholder.
+        If provider-backed summarization fails, returns a deterministic local
+        extractive summary rather than an information-free placeholder.
         """
         now = time.monotonic()
         if now < self._summary_failure_cooldown_until:
@@ -1580,7 +1735,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 "Skipping context summary during cooldown (%.0fs remaining)",
                 self._summary_failure_cooldown_until - now,
             )
-            return None
+            return self._generate_extractive_fallback_summary(
+                turns_to_summarize,
+                reason="provider-backed summarizer cooldown active",
+            )
 
         summary_budget = self._compute_summary_budget(turns_to_summarize)
         content_to_summarize = self._serialize_for_summary(turns_to_summarize)
@@ -1820,17 +1978,22 @@ This compaction should PRIORITISE preserving all information related to the focu
             # other exception flow into the generic fallback logic so they get
             # a main-model retry before any cooldown. (#11978, #11914)
             if isinstance(e, RuntimeError) and "no llm provider configured" in str(e).lower():
-                # No provider configured — long cooldown, unlikely to self-resolve
-                self._record_compression_failure_cooldown(
-                    _SUMMARY_FAILURE_COOLDOWN_SECONDS,
-                    "no auxiliary LLM provider configured",
+                # No provider configured — use a deterministic local checkpoint
+                # rather than dropping the compacted turns. Keep cooldown clear
+                # so a later configured provider can be used immediately.
+                err_text = "no auxiliary LLM provider configured"
+                self._clear_compression_failure_cooldown()
+                self._last_summary_error = None
+                self._last_summary_auth_failure = False
+                self._last_summary_network_failure = False
+                logger.warning(
+                    "Context compression: no provider available for summary. "
+                    "Using local extractive fallback summary."
                 )
-                self._last_summary_error = "no auxiliary LLM provider configured"
-                logger.warning("Context compression: no provider available for "
-                                "summary. Middle turns will be dropped without summary "
-                                "for %d seconds.",
-                                _SUMMARY_FAILURE_COOLDOWN_SECONDS)
-                return None
+                return self._generate_extractive_fallback_summary(
+                    turns_to_summarize,
+                    reason=err_text,
+                )
             # If the summary model is different from the main model and the
             # error looks permanent (model not found, 503, 404), fall back to
             # using the main model instead of entering cooldown that leaves
@@ -1932,31 +2095,24 @@ This compaction should PRIORITISE preserving all information related to the focu
                 self._fallback_to_main_for_compression(e, "failed")
                 return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
 
-            # Transient errors (timeout, rate limit, network, JSON decode,
-            # streaming premature-close) — shorter cooldown for JSON decode and
-            # streaming-closed since those conditions can self-resolve quickly.
-            _transient_cooldown = 30 if (_is_json_decode or _is_streaming_closed) else 60
+            # Final failure path: preserve an extractive local checkpoint rather
+            # than replacing the compacted span with an information-free marker.
             err_text = str(e).strip() or e.__class__.__name__
             if len(err_text) > 220:
                 err_text = err_text[:217].rstrip() + "..."
-            self._record_compression_failure_cooldown(_transient_cooldown, err_text)
-            self._last_summary_error = err_text
-            # A terminal connection/network failure (we reach this branch only
-            # after any main-model fallback has already been tried or is
-            # unavailable). Flag it so compress() ABORTS and preserves the
-            # session unchanged instead of destroying the middle window for a
-            # placeholder marker — retrying once the network recovers is
-            # strictly better than dropping context (#29559, #25585). Mirrors
-            # the auth-failure carve-out; independent of abort_on_summary_failure.
-            if _is_streaming_closed:
-                self._last_summary_network_failure = True
+            self._clear_compression_failure_cooldown()
+            self._last_summary_error = None
+            self._last_summary_auth_failure = False
+            self._last_summary_network_failure = False
             logger.warning(
-                "Failed to generate context summary: %s. "
-                "Further summary attempts paused for %d seconds.",
-                e,
-                _transient_cooldown,
+                "Failed to generate provider-backed context summary (%s). "
+                "Using local extractive fallback summary.",
+                err_text,
             )
-            return None
+            return self._generate_extractive_fallback_summary(
+                turns_to_summarize,
+                reason=err_text,
+            )
 
     @staticmethod
     def _strip_summary_prefix(summary: str) -> str:
