@@ -402,6 +402,7 @@ class TestSendMessageTool:
             thread_id="171.000001",
             media_files=[],
             force_document=False,
+            metadata=None,
         )
 
     def test_resolved_matrix_thread_name_preserves_thread_id(self):
@@ -443,6 +444,7 @@ class TestSendMessageTool:
             thread_id="$thread123:matrix.example.org",
             media_files=[],
             force_document=False,
+            metadata=None,
         )
 
     def test_mirror_receives_current_session_user_id(self):
