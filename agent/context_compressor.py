@@ -1978,10 +1978,25 @@ This compaction should PRIORITISE preserving all information related to the focu
             # other exception flow into the generic fallback logic so they get
             # a main-model retry before any cooldown. (#11978, #11914)
             if isinstance(e, RuntimeError) and "no llm provider configured" in str(e).lower():
-                # No provider configured — use a deterministic local checkpoint
-                # rather than dropping the compacted turns. Keep cooldown clear
-                # so a later configured provider can be used immediately.
+                # No provider configured. If the caller explicitly requested
+                # abort-on-failure, preserve the conversation unchanged;
+                # otherwise use a deterministic local checkpoint rather than
+                # dropping the compacted turns. Keep cooldown clear on the
+                # fallback path so a later configured provider can be used
+                # immediately.
                 err_text = "no auxiliary LLM provider configured"
+                if self.abort_on_summary_failure:
+                    self._record_compression_failure_cooldown(
+                        _SUMMARY_FAILURE_COOLDOWN_SECONDS,
+                        err_text,
+                    )
+                    self._last_summary_error = err_text
+                    logger.warning(
+                        "Context compression: provider-backed summary unavailable (%s); "
+                        "aborting compression because abort_on_summary_failure is enabled.",
+                        err_text,
+                    )
+                    return None
                 self._clear_compression_failure_cooldown()
                 self._last_summary_error = None
                 self._last_summary_auth_failure = False
@@ -2100,6 +2115,18 @@ This compaction should PRIORITISE preserving all information related to the focu
             err_text = str(e).strip() or e.__class__.__name__
             if len(err_text) > 220:
                 err_text = err_text[:217].rstrip() + "..."
+            if self.abort_on_summary_failure:
+                self._record_compression_failure_cooldown(
+                    _SUMMARY_FAILURE_COOLDOWN_SECONDS,
+                    err_text,
+                )
+                self._last_summary_error = err_text
+                logger.warning(
+                    "Failed to generate provider-backed context summary (%s); "
+                    "aborting compression because abort_on_summary_failure is enabled.",
+                    err_text,
+                )
+                return None
             self._clear_compression_failure_cooldown()
             self._last_summary_error = None
             self._last_summary_auth_failure = False

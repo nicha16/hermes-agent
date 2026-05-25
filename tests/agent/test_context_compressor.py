@@ -134,7 +134,9 @@ class TestCompress:
         assert compressor.compression_count == 1
         # Abort flag must NOT fire under the default config.
         assert compressor._last_compress_aborted is False
-        assert compressor._last_summary_fallback_used is True
+        assert compressor._last_summary_fallback_used is False
+        assert compressor._last_summary_dropped_count == 0
+        assert compressor._last_summary_error is None
 
     def test_summary_failure_uses_deterministic_fallback_with_recovered_context(self):
         """Regression: failed LLM summaries should not emit a content-free marker.

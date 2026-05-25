@@ -516,6 +516,7 @@ class TestSendMessageTool:
             thread_id=None,
             media_files=[],
             force_document=False,
+            metadata=None,
         )
 
     def test_top_level_send_failure_redacts_query_token(self):
