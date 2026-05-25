@@ -169,8 +169,9 @@ class InsightsEngine:
 
     # Columns we actually need (skip system_prompt, model_config blobs)
     _SESSION_COLS = ("id, source, model, started_at, ended_at, "
-                     "message_count, tool_call_count, input_tokens, output_tokens, "
-                     "cache_read_tokens, cache_write_tokens, billing_provider, "
+                     "message_count, tool_call_count, api_call_count, "
+                     "input_tokens, output_tokens, cache_read_tokens, "
+                     "cache_write_tokens, reasoning_tokens, billing_provider, "
                      "billing_base_url, billing_mode, estimated_cost_usd, "
                      "actual_cost_usd, cost_status, cost_source")
 
@@ -405,8 +406,14 @@ class InsightsEngine:
         total_output = sum(s.get("output_tokens") or 0 for s in sessions)
         total_cache_read = sum(s.get("cache_read_tokens") or 0 for s in sessions)
         total_cache_write = sum(s.get("cache_write_tokens") or 0 for s in sessions)
-        total_tokens = total_input + total_output + total_cache_read + total_cache_write
+        total_reasoning = sum(s.get("reasoning_tokens") or 0 for s in sessions)
+        total_prompt = total_input + total_cache_read + total_cache_write
+        total_cache = total_cache_read + total_cache_write
+        total_tokens = total_prompt + total_output + total_reasoning
+        cache_hit_rate = (total_cache_read / total_prompt * 100) if total_prompt else 0.0
+        fresh_input_share = (total_input / total_prompt * 100) if total_prompt else 0.0
         total_tool_calls = sum(s.get("tool_call_count") or 0 for s in sessions)
+        total_api_calls = sum(s.get("api_call_count") or 0 for s in sessions)
         total_messages = sum(s.get("message_count") or 0 for s in sessions)
 
         # Cost estimation (weighted by model)
@@ -455,7 +462,15 @@ class InsightsEngine:
             "total_output_tokens": total_output,
             "total_cache_read_tokens": total_cache_read,
             "total_cache_write_tokens": total_cache_write,
+            "total_cache_tokens": total_cache,
+            "total_prompt_tokens": total_prompt,
+            "total_reasoning_tokens": total_reasoning,
+            "cache_hit_rate": cache_hit_rate,
+            "fresh_input_share": fresh_input_share,
             "total_tokens": total_tokens,
+            "total_api_calls": total_api_calls,
+            "avg_tokens_per_api_call": total_tokens / total_api_calls if total_api_calls else 0,
+            "avg_prompt_tokens_per_api_call": total_prompt / total_api_calls if total_api_calls else 0,
             "estimated_cost": total_cost,
             "actual_cost": actual_cost,
             "total_hours": total_hours,
@@ -478,7 +493,8 @@ class InsightsEngine:
         model_data = defaultdict(lambda: {
             "sessions": 0, "input_tokens": 0, "output_tokens": 0,
             "cache_read_tokens": 0, "cache_write_tokens": 0,
-            "total_tokens": 0, "tool_calls": 0, "cost": 0.0,
+            "reasoning_tokens": 0, "prompt_tokens": 0,
+            "total_tokens": 0, "tool_calls": 0, "api_calls": 0, "cost": 0.0,
         })
 
         for s in sessions:
@@ -491,12 +507,17 @@ class InsightsEngine:
             out = s.get("output_tokens") or 0
             cache_read = s.get("cache_read_tokens") or 0
             cache_write = s.get("cache_write_tokens") or 0
+            reasoning = s.get("reasoning_tokens") or 0
+            prompt = inp + cache_read + cache_write
             d["input_tokens"] += inp
             d["output_tokens"] += out
             d["cache_read_tokens"] += cache_read
             d["cache_write_tokens"] += cache_write
-            d["total_tokens"] += inp + out + cache_read + cache_write
+            d["reasoning_tokens"] += reasoning
+            d["prompt_tokens"] += prompt
+            d["total_tokens"] += prompt + out + reasoning
             d["tool_calls"] += s.get("tool_call_count") or 0
+            d["api_calls"] += s.get("api_call_count") or 0
             estimate, status = _estimate_cost(s)
             d["cost"] += estimate
             d["has_pricing"] = has_known_pricing(model, s.get("billing_provider"), s.get("billing_base_url"))
@@ -515,7 +536,8 @@ class InsightsEngine:
         platform_data = defaultdict(lambda: {
             "sessions": 0, "messages": 0, "input_tokens": 0,
             "output_tokens": 0, "cache_read_tokens": 0,
-            "cache_write_tokens": 0, "total_tokens": 0, "tool_calls": 0,
+            "cache_write_tokens": 0, "reasoning_tokens": 0, "prompt_tokens": 0,
+            "total_tokens": 0, "tool_calls": 0, "api_calls": 0,
         })
 
         for s in sessions:
@@ -527,12 +549,17 @@ class InsightsEngine:
             out = s.get("output_tokens") or 0
             cache_read = s.get("cache_read_tokens") or 0
             cache_write = s.get("cache_write_tokens") or 0
+            reasoning = s.get("reasoning_tokens") or 0
+            prompt = inp + cache_read + cache_write
             d["input_tokens"] += inp
             d["output_tokens"] += out
             d["cache_read_tokens"] += cache_read
             d["cache_write_tokens"] += cache_write
-            d["total_tokens"] += inp + out + cache_read + cache_write
+            d["reasoning_tokens"] += reasoning
+            d["prompt_tokens"] += prompt
+            d["total_tokens"] += prompt + out + reasoning
             d["tool_calls"] += s.get("tool_call_count") or 0
+            d["api_calls"] += s.get("api_call_count") or 0
 
         result = [
             {"platform": platform, **data}
@@ -684,12 +711,24 @@ class InsightsEngine:
                 "date": datetime.fromtimestamp(most_msgs["started_at"]).strftime("%b %d") if most_msgs.get("started_at") else "?",
             })
 
-        # Most tokens
+        # Most reported tokens (fresh input + cached prompt + output + reasoning)
         most_tokens = max(
             sessions,
-            key=lambda s: (s.get("input_tokens") or 0) + (s.get("output_tokens") or 0),
+            key=lambda s: (
+                (s.get("input_tokens") or 0)
+                + (s.get("cache_read_tokens") or 0)
+                + (s.get("cache_write_tokens") or 0)
+                + (s.get("output_tokens") or 0)
+                + (s.get("reasoning_tokens") or 0)
+            ),
         )
-        token_total = (most_tokens.get("input_tokens") or 0) + (most_tokens.get("output_tokens") or 0)
+        token_total = (
+            (most_tokens.get("input_tokens") or 0)
+            + (most_tokens.get("cache_read_tokens") or 0)
+            + (most_tokens.get("cache_write_tokens") or 0)
+            + (most_tokens.get("output_tokens") or 0)
+            + (most_tokens.get("reasoning_tokens") or 0)
+        )
         if token_total > 0:
             top.append({
                 "label": "Most tokens",
@@ -751,9 +790,16 @@ class InsightsEngine:
         lines.append("  📋 Overview")
         lines.append("  " + "─" * 56)
         lines.append(f"  Sessions:          {o['total_sessions']:<12}  Messages:        {o['total_messages']:,}")
-        lines.append(f"  Tool calls:        {o['total_tool_calls']:<12,}  User messages:   {o['user_messages']:,}")
-        lines.append(f"  Input tokens:      {o['total_input_tokens']:<12,}  Output tokens:   {o['total_output_tokens']:,}")
-        lines.append(f"  Total tokens:      {o['total_tokens']:,}")
+        lines.append(f"  Tool calls:        {o['total_tool_calls']:<12,}  API calls:       {o.get('total_api_calls', 0):,}")
+        lines.append(f"  Fresh input:       {o['total_input_tokens']:<12,}  Output:          {o['total_output_tokens']:,}")
+        lines.append(f"  Cached input:      {o['total_cache_read_tokens']:<12,}  Cache writes:    {o['total_cache_write_tokens']:,}")
+        lines.append(f"  Reasoning:         {o['total_reasoning_tokens']:<12,}  Prompt total:    {o['total_prompt_tokens']:,}")
+        lines.append(f"  Reported total:    {o['total_tokens']:,}")
+        if o.get("total_prompt_tokens"):
+            lines.append(
+                f"  Prompt cache hit:  {o['cache_hit_rate']:.1f}%"
+                f"          Fresh share:     {o['fresh_input_share']:.1f}%"
+            )
         if o["total_hours"] > 0:
             lines.append(f"  Active time:       ~{format_duration_compact(o['total_hours'] * 3600):<11}  Avg session:     ~{format_duration_compact(o['avg_session_duration'])}")
         lines.append(f"  Avg msgs/session:  {o['avg_messages_per_session']:.1f}")
@@ -763,19 +809,21 @@ class InsightsEngine:
         if report["models"]:
             lines.append("  🤖 Models Used")
             lines.append("  " + "─" * 56)
-            lines.append(f"  {'Model':<30} {'Sessions':>8} {'Tokens':>12}")
+            lines.append(f"  {'Model':<30} {'Sessions':>8} {'Fresh':>10} {'Cached':>10} {'Total':>12}")
             for m in report["models"]:
                 model_name = m["model"][:28]
-                lines.append(f"  {model_name:<30} {m['sessions']:>8} {m['total_tokens']:>12,}")
+                cached = m.get("cache_read_tokens", 0) + m.get("cache_write_tokens", 0)
+                lines.append(f"  {model_name:<30} {m['sessions']:>8} {m['input_tokens']:>10,} {cached:>10,} {m['total_tokens']:>12,}")
             lines.append("")
 
         # Platform breakdown
         if len(report["platforms"]) > 1 or (report["platforms"] and report["platforms"][0]["platform"] != "cli"):
             lines.append("  📱 Platforms")
             lines.append("  " + "─" * 56)
-            lines.append(f"  {'Platform':<14} {'Sessions':>8} {'Messages':>10} {'Tokens':>14}")
+            lines.append(f"  {'Platform':<14} {'Sessions':>8} {'API':>8} {'Fresh':>10} {'Cached':>10} {'Total':>12}")
             for p in report["platforms"]:
-                lines.append(f"  {p['platform']:<14} {p['sessions']:>8} {p['messages']:>10,} {p['total_tokens']:>14,}")
+                cached = p.get("cache_read_tokens", 0) + p.get("cache_write_tokens", 0)
+                lines.append(f"  {p['platform']:<14} {p['sessions']:>8} {p.get('api_calls', 0):>8,} {p['input_tokens']:>10,} {cached:>10,} {p['total_tokens']:>12,}")
             lines.append("")
 
         # Tool usage
@@ -867,8 +915,14 @@ class InsightsEngine:
         lines.append(f"📊 **Hermes Insights** — Last {days} days\n")
 
         # Overview
-        lines.append(f"**Sessions:** {o['total_sessions']} | **Messages:** {o['total_messages']:,} | **Tool calls:** {o['total_tool_calls']:,}")
-        lines.append(f"**Tokens:** {o['total_tokens']:,} (in: {o['total_input_tokens']:,} / out: {o['total_output_tokens']:,})")
+        lines.append(f"**Sessions:** {o['total_sessions']} | **Messages:** {o['total_messages']:,} | **Tool calls:** {o['total_tool_calls']:,} | **API calls:** {o.get('total_api_calls', 0):,}")
+        lines.append(
+            f"**Tokens:** {o['total_tokens']:,} reported "
+            f"(fresh: {o['total_input_tokens']:,} / cached: {o['total_cache_read_tokens']:,} / "
+            f"out: {o['total_output_tokens']:,} / reasoning: {o['total_reasoning_tokens']:,})"
+        )
+        if o.get("total_prompt_tokens"):
+            lines.append(f"**Prompt cache hit:** {o['cache_hit_rate']:.1f}% | **Fresh prompt share:** {o['fresh_input_share']:.1f}%")
         if o["total_hours"] > 0:
             lines.append(f"**Active time:** ~{format_duration_compact(o['total_hours'] * 3600)} | **Avg session:** ~{format_duration_compact(o['avg_session_duration'])}")
         lines.append("")
@@ -877,14 +931,16 @@ class InsightsEngine:
         if report["models"]:
             lines.append("**🤖 Models:**")
             for m in report["models"][:5]:
-                lines.append(f"  {m['model'][:25]} — {m['sessions']} sessions, {m['total_tokens']:,} tokens")
+                cached = m.get("cache_read_tokens", 0) + m.get("cache_write_tokens", 0)
+                lines.append(f"  {m['model'][:25]} — {m['sessions']} sessions, {m['input_tokens']:,} fresh / {cached:,} cached / {m['total_tokens']:,} total")
             lines.append("")
 
         # Platforms (if multi-platform)
         if len(report["platforms"]) > 1:
             lines.append("**📱 Platforms:**")
             for p in report["platforms"]:
-                lines.append(f"  {p['platform']} — {p['sessions']} sessions, {p['messages']:,} msgs")
+                cached = p.get("cache_read_tokens", 0) + p.get("cache_write_tokens", 0)
+                lines.append(f"  {p['platform']} — {p['sessions']} sessions, {p.get('api_calls', 0):,} API calls, {p['input_tokens']:,} fresh / {cached:,} cached")
             lines.append("")
 
         # Tools (top 8)
