@@ -493,6 +493,15 @@ class TestTerminalFormatting:
 
         assert "█" in text  # Bar chart characters
 
+    def test_terminal_format_labels_active_days_as_calendar_dates(self, populated_db):
+        """The rolling lookback window can touch more calendar dates than whole days."""
+        engine = InsightsEngine(populated_db)
+        report = engine.generate(days=30)
+        text = engine.format_terminal(report)
+
+        assert "Active calendar dates" in text
+        assert "Active days:" not in text
+
     def test_terminal_format_hides_cost_for_custom_models(self, db):
         """Cost display is hidden entirely — custom models no longer show 'N/A' either."""
         db.create_session(session_id="s1", source="cli", model="my-custom-model")
@@ -541,6 +550,15 @@ class TestGatewayFormatting:
 
         assert "Models" in text
         assert "sessions" in text
+
+    def test_gateway_format_labels_active_days_as_calendar_dates(self, populated_db):
+        """The rolling lookback window can touch more calendar dates than whole days."""
+        engine = InsightsEngine(populated_db)
+        report = engine.generate(days=30)
+        text = engine.format_gateway(report)
+
+        assert "**Active calendar dates:**" in text
+        assert "**Active days:**" not in text
 
 
 # =========================================================================

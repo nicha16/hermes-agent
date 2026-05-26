@@ -651,7 +651,8 @@ class InsightsEngine:
         busiest_day = max(day_breakdown, key=lambda x: x["count"]) if day_breakdown else None
         busiest_hour = max(hour_breakdown, key=lambda x: x["count"]) if hour_breakdown else None
 
-        # Active days (days with at least one session)
+        # Active calendar dates (date strings with at least one session). A rolling
+        # N-day lookback can touch N+1 calendar dates depending on current time.
         active_days = len(daily_counts)
 
         # Streak calculation
@@ -887,7 +888,7 @@ class InsightsEngine:
                 lines.append(f"  Peak hours: {', '.join(hour_strs)}")
 
             if act.get("active_days"):
-                lines.append(f"  Active days: {act['active_days']}")
+                lines.append(f"  Active calendar dates: {act['active_days']}")
             if act.get("max_streak") and act["max_streak"] > 1:
                 lines.append(f"  Best streak: {act['max_streak']} consecutive days")
             lines.append("")
@@ -970,7 +971,7 @@ class InsightsEngine:
             display_hr = hr % 12 or 12
             lines.append(f"**📅 Busiest:** {act['busiest_day']['day']}s ({act['busiest_day']['count']} sessions), {display_hr}{ampm} ({act['busiest_hour']['count']} sessions)")
             if act.get("active_days"):
-                lines.append(f"**Active days:** {act['active_days']}", )
+                lines.append(f"**Active calendar dates:** {act['active_days']}", )
             if act.get("max_streak", 0) > 1:
                 lines.append(f"**Best streak:** {act['max_streak']} consecutive days")
 
