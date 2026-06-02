@@ -276,6 +276,7 @@ class TestSendMessageTool:
             {
                 "HERMES_CRON_AUTO_DELIVER_PLATFORM": "telegram",
                 "HERMES_CRON_AUTO_DELIVER_CHAT_ID": "-1001",
+                "HERMES_CRON_AUTO_DELIVER_THREAD_ID": "",
             },
             clear=False,
         ), \
@@ -402,7 +403,6 @@ class TestSendMessageTool:
             thread_id="171.000001",
             media_files=[],
             force_document=False,
-            metadata=None,
         )
 
     def test_resolved_matrix_thread_name_preserves_thread_id(self):
@@ -444,7 +444,6 @@ class TestSendMessageTool:
             thread_id="$thread123:matrix.example.org",
             media_files=[],
             force_document=False,
-            metadata=None,
         )
 
     def test_mirror_receives_current_session_user_id(self):
@@ -516,7 +515,6 @@ class TestSendMessageTool:
             thread_id=None,
             media_files=[],
             force_document=False,
-            metadata=None,
         )
 
     def test_top_level_send_failure_redacts_query_token(self):
