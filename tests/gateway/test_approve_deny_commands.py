@@ -18,7 +18,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
-from gateway.session import SessionSource
+from gateway.session import SessionSource, build_session_key
 
 
 def _make_source() -> SessionSource:
