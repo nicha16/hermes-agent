@@ -708,19 +708,25 @@ def _live_system_guard(request, monkeypatch):
             tokens = cmd_str.split()
         if not tokens:
             return False
-        for tok in tokens:
-            head = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-            if head in _PROCESS_KILLERS:
-                low = cmd_str.lower()
-                # pkill -f pattern: catch hermes-themed patterns + a
-                # plain "python" -f which would catch the live gateway
-                # whose cmdline contains "python -m hermes_cli.main".
-                if (
-                    "hermes" in low
-                    or "gateway" in low
-                    or ("python" in low and "-f" in tokens)
-                ):
-                    return True
+        # Only the executable token determines whether this is a process-killer
+        # command. Earlier versions scanned every argument, so benign commands
+        # such as `rg "real skill" .../pytest-of-hermes/...` were blocked
+        # because an argument split to the word "skill" while the path contained
+        # "hermes". Arguments are inspected below only after the executable is
+        # known to be pkill/killall/taskkill/etc.
+        head = tokens[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if head not in _PROCESS_KILLERS:
+            return False
+        low = cmd_str.lower()
+        # pkill -f pattern: catch hermes-themed patterns + a
+        # plain "python" -f which would catch the live gateway
+        # whose cmdline contains "python -m hermes_cli.main".
+        if (
+            "hermes" in low
+            or "gateway" in low
+            or ("python" in low and "-f" in tokens)
+        ):
+            return True
         return False
 
     def _check_subprocess_cmd(name, cmd):

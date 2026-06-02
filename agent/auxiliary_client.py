@@ -401,7 +401,13 @@ _PROVIDER_VISION_MODELS: Dict[str, str] = {
 # api.kimi.com/coding (Anthropic Messages wire) which Kimi's own docs
 # describe as having no image_in capability. Vision lives on the separate
 # Kimi Platform (api.moonshot.ai, OpenAI-wire, pay-as-you-go).  See #17076.
+#
+# deepseek: DeepSeek's direct chat endpoint is text-only for image input. Keep
+# this provider-level guard even when models.dev metadata is missing or stale,
+# otherwise a partial cache can make auto vision routing fall through to the
+# main DeepSeek client and fail at API time with image_url payloads (#31179).
 _PROVIDERS_WITHOUT_VISION: frozenset = frozenset({
+    "deepseek",
     "kimi-coding",
     "kimi-coding-cn",
 })

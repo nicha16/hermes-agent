@@ -272,6 +272,27 @@ def test_subprocess_pkill_with_unrelated_pattern_passes_through():
     assert r.returncode == 0
 
 
+def test_non_killer_command_with_skill_arg_and_hermes_path_passes_through(tmp_path):
+    """A benign command must not be blocked just because an argument says
+    "skill" and a temp path contains "hermes".
+
+    This is the shape used by ripgrep tests under /tmp/pytest-of-hermes/...;
+    the live-system guard should classify only the executable token as a
+    process killer, not every argument.
+    """
+    target = tmp_path / "skills"
+    target.mkdir()
+    (target / "real.md").write_text("real skill\n")
+    r = subprocess.run(
+        ["rg", "--no-heading", "real skill", str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r.returncode == 0
+    assert "real skill" in r.stdout
+
+
 def test_normal_subprocess_run_passes_through():
     """Plain non-systemctl subprocess.run should work normally."""
     r = subprocess.run(["echo", "hello"], capture_output=True, text=True)

@@ -64,7 +64,7 @@ def _fresh_modules():
     """Drop cached hermes modules so each test reloads against current env."""
     for mod in list(sys.modules.keys()):
         if mod.startswith(("agent.auxiliary_client", "agent.image_routing",
-                           "tools.vision_tools", "tools.browser_tool",
+                           "agent.models_dev", "tools.vision_tools", "tools.browser_tool",
                            "hermes_cli.config")):
             del sys.modules[mod]
 
@@ -179,6 +179,45 @@ model:
         provider, client, _model = resolve_vision_provider_client(provider="auto")
         assert client is not None
         assert provider == "anthropic"
+
+    def test_stale_models_dev_cache_does_not_make_deepseek_look_vision_capable(
+        self, isolated_home, monkeypatch
+    ):
+        """A stale/incomplete models.dev cache must not route images to DeepSeek.
+
+        If the disk cache has a partial DeepSeek catalog that lacks the active
+        model, capability lookup returns unknown. Unknown stays permissive for
+        new/custom providers, but DeepSeek's direct endpoint is known text-only
+        for image payloads and must be skipped by provider-level guard.
+        """
+        _write_config(isolated_home, """
+model:
+  provider: deepseek
+  default: deepseek-v4-pro
+""")
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+
+        import json
+
+        cache = {
+            "deepseek": {
+                "id": "deepseek",
+                "models": {
+                    "deepseek-chat": {
+                        "id": "deepseek-chat",
+                        "limit": {"context": 128000, "output": 8192},
+                    },
+                },
+            },
+        }
+        with open(os.path.join(isolated_home, "models_dev_cache.json"), "w") as fp:
+            json.dump(cache, fp)
+        _fresh_modules()
+
+        from agent.auxiliary_client import resolve_vision_provider_client
+        provider, client, _model = resolve_vision_provider_client(provider="auto")
+        assert provider is None
+        assert client is None
 
     def test_unknown_capability_does_not_block(self, isolated_home, monkeypatch):
         """When models.dev has no entry, fall back to permissive (attempt the call).
