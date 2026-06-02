@@ -13,6 +13,7 @@ the safety net in _run_agent discards leaked command text.
 """
 
 import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -132,6 +133,19 @@ class TestCommandBypassActiveSession:
         adapter._active_sessions[sk] = asyncio.Event()
 
         await adapter.handle_message(_make_event("/approve"))
+
+        assert sk not in adapter._pending_messages
+        assert any("handled:approve" in r for r in adapter.sent_responses)
+
+    @pytest.mark.asyncio
+    async def test_natural_approval_bypasses_guard_when_exec_approval_pending(self):
+        """Mobile users can type approval in prose instead of a slash command."""
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        with patch("tools.approval.has_blocking_approval", return_value=True):
+            await adapter.handle_message(_make_event("I approve downloading the official XPI"))
 
         assert sk not in adapter._pending_messages
         assert any("handled:approve" in r for r in adapter.sent_responses)

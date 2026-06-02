@@ -1284,6 +1284,11 @@ class TestMediaDeliveryDefaultMode:
         )
 
         assert BasePlatformAdapter.validate_media_delivery_path(str(link)) is None
+    def test_default_roots_include_legacy_media_cache(self):
+        from gateway.platforms.base import MEDIA_DELIVERY_SAFE_ROOTS
+
+        assert any(root.name == "media_cache" for root in MEDIA_DELIVERY_SAFE_ROOTS)
+
 
 
 # ---------------------------------------------------------------------------

@@ -107,6 +107,28 @@ def _reply_anchor_for_event(event) -> str | None:
     return getattr(event, "message_id", None)
 
 
+_NATURAL_APPROVAL_RE = re.compile(
+    r"^\s*(?:"
+    r"approve(?:d)?"
+    r"|i\s+approve(?:\b|\s+)"
+    r"|yes[,!\s]+approve(?:d)?"
+    r"|approved[,!\s]+go\s+ahead"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_natural_approval_reply(text: str | None) -> bool:
+    """Return True for plain-text replies that intend to approve a prompt.
+
+    This intentionally stays narrow and is only used when there is already a
+    concrete pending approval for the same gateway session. It lets mobile/chat
+    users type natural approvals like ``Approve`` or ``I approve ...`` instead
+    of requiring a slash command or host-terminal prompt.
+    """
+    return bool(_NATURAL_APPROVAL_RE.match(str(text or "").strip()))
+
+
 def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bool:
     """Return True when a media file should use the platform's audio sender.
 
@@ -958,6 +980,10 @@ MEDIA_DELIVERY_SAFE_ROOTS = (
     _HERMES_HOME / "video_cache",
     _HERMES_HOME / "document_cache",
     _HERMES_HOME / "browser_screenshots",
+    # Legacy/general media cache used by generated images and some tools.
+    # Keep this aligned with tool schemas that advertise MEDIA:<path> under
+    # a Hermes media cache as deliverable.
+    _HERMES_HOME / "media_cache",
     # Canonical cache layout — listed alongside the legacy *_cache dirs so
     # generated artifacts deliver on installs that have both (#31733).
     _HERMES_HOME / "cache" / "images",
@@ -965,48 +991,6 @@ MEDIA_DELIVERY_SAFE_ROOTS = (
     _HERMES_HOME / "cache" / "videos",
     _HERMES_HOME / "cache" / "documents",
     _HERMES_HOME / "cache" / "screenshots",
-)
-
-# Default recency window for trusting freshly-produced files (seconds).
-# The agent's actual work generally completes well inside 10 minutes; legitimate
-# build artifacts (PDFs from pandoc, plots from matplotlib, etc.) almost always
-# land seconds before delivery. Old system files (/etc/passwd, ~/.ssh/id_rsa,
-# stray credentials) have mtimes measured in days or months — well outside this
-# window — so prompt-injection paths pointing at pre-existing host files are
-# still rejected.
-_MEDIA_DELIVERY_TRUST_RECENT_DEFAULT_SECONDS = 600
-
-# Hard denylist applied even when a path would otherwise pass recency trust.
-# These prefixes hold credentials, system state, or process introspection that
-# should never be uploaded as a gateway attachment, regardless of how new the
-# file looks. The cache-dir allowlist still beats this — an operator-configured
-# allowed root can intentionally live under one of these prefixes (rare, but
-# their choice).
-_MEDIA_DELIVERY_DENIED_PREFIXES = (
-    "/etc",
-    "/proc",
-    "/sys",
-    "/dev",
-    "/root",
-    "/boot",
-    "/var/log",
-    "/var/lib",
-    "/var/run",
-)
-
-# Within $HOME we additionally deny common credential / config directories.
-# Resolved at check time against the live $HOME so containers and alt-home
-# setups work correctly.
-_MEDIA_DELIVERY_DENIED_HOME_SUBPATHS = (
-    ".ssh",
-    ".aws",
-    ".gnupg",
-    ".kube",
-    ".docker",
-    ".config",
-    ".azure",
-    ".gcloud",
-    "Library/Keychains",  # macOS
 )
 
 
@@ -4407,6 +4391,14 @@ class BasePlatformAdapter(ABC):
             # session lifecycle and its cleanup races with the running task
             # (see PR #4926).
             cmd = event.get_command()
+            if not cmd and looks_like_natural_approval_reply(event.text):
+                try:
+                    from tools.approval import has_blocking_approval
+                    if has_blocking_approval(session_key):
+                        event.text = "/approve session"
+                        cmd = "approve"
+                except Exception:
+                    pass
             from hermes_cli.commands import should_bypass_active_session
 
             if should_bypass_active_session(cmd):

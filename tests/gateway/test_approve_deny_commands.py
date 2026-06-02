@@ -191,6 +191,58 @@ class TestBlockingGatewayApproval:
 
 
 # ------------------------------------------------------------------
+# Natural-language approval carry-forward
+# ------------------------------------------------------------------
+
+
+class TestNaturalApprovalPreseed:
+    """Natural Telegram approval should carry a timed-out prompt forward."""
+
+    def setup_method(self):
+        _clear_approval_state()
+
+    def test_stale_pending_natural_approval_approves_pattern_for_session(self):
+        from tools.approval import is_approved
+
+        runner = _make_runner()
+        source = _make_source()
+        session_key = build_session_key(source)
+        runner._pending_approvals[session_key] = {
+            "pattern_key": "test-pattern",
+            "pattern_keys": ["test-pattern", "tirith:test"],
+            "created_at": time.time() - 60,
+        }
+
+        updated = runner._maybe_apply_stale_natural_approval(
+            session_key,
+            "I approve downloading the official XPI",
+        )
+
+        assert "System note" in updated
+        assert is_approved(session_key, "test-pattern") is True
+        assert is_approved(session_key, "tirith:test") is True
+        assert session_key not in runner._pending_approvals
+
+    def test_expired_natural_approval_does_not_approve_old_prompt(self):
+        from tools.approval import is_approved
+
+        runner = _make_runner()
+        source = _make_source()
+        session_key = build_session_key(source)
+        runner._pending_approvals[session_key] = {
+            "pattern_key": "old-pattern",
+            "created_at": time.time() - (7 * 60 * 60),
+        }
+
+        message = "I approve the old command"
+        updated = runner._maybe_apply_stale_natural_approval(session_key, message)
+
+        assert updated == message
+        assert is_approved(session_key, "old-pattern") is False
+        assert session_key in runner._pending_approvals
+
+
+# ------------------------------------------------------------------
 # /approve command
 # ------------------------------------------------------------------
 

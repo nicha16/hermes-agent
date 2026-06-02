@@ -1674,6 +1674,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     _reply_anchor_for_event,
+    looks_like_natural_approval_reply,
     merge_pending_message_event,
 )
 from gateway.restart import (
@@ -13063,7 +13064,143 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     _APPROVAL_TIMEOUT_SECONDS = 300  # 5 minutes
 
+    def _maybe_apply_stale_natural_approval(self, session_key: str, message: str) -> str:
+        """Apply a natural-language Telegram approval to a recent stale exec prompt.
 
+        A mobile user may approve after the blocking approval wait has already
+        timed out, then expect the agent to continue in the same turn. Keep the
+        approval scoped to pattern keys from the previous concrete prompt in the
+        same session; do not infer approval from text alone.
+        """
+        if not session_key or not isinstance(message, str):
+            return message
+        if not looks_like_natural_approval_reply(message):
+            return message
+        try:
+            pending = self._pending_approvals.get(session_key)
+            created_at = float((pending or {}).get("created_at") or 0.0)
+            # Keep enough runway for a mobile user to approve after the original
+            # 5-minute wait has timed out, but avoid reviving old approvals from
+            # unrelated work days later.
+            if not pending or (time.time() - created_at) > 6 * 60 * 60:
+                return message
+            from tools.approval import approve_session
+            keys = pending.get("pattern_keys") or [pending.get("pattern_key")]
+            approved_keys = [str(k) for k in keys if k]
+            if not approved_keys:
+                return message
+            for key in approved_keys:
+                approve_session(session_key, key)
+            self._pending_approvals.pop(session_key, None)
+            logger.info(
+                "Natural Telegram approval registered for %d pattern(s) in %s",
+                len(approved_keys), session_key,
+            )
+            return (
+                "[System note: The user's current message was interpreted as "
+                "Telegram approval for the previous pending terminal/action "
+                "approval in this same session. The relevant dangerous-command "
+                "pattern(s) have been approved for this session, so continue the "
+                "approved workflow without asking the user to approve again unless "
+                "the next action is outside that scope.]\n\n"
+                + message
+            )
+        except Exception as exc:
+            logger.debug("Natural approval pre-seed failed: %s", exc)
+            return message
+
+    async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle /approve command — unblock waiting agent thread(s).
+
+        Supports multiple concurrent approvals (parallel subagents,
+        execute_code).  ``/approve`` resolves the oldest pending command;
+        ``/approve all`` resolves every pending command at once.
+
+        Usage:
+            /approve              — approve oldest pending command once
+            /approve all          — approve ALL pending commands at once
+            /approve session      — approve oldest + remember for session
+            /approve all session  — approve all + remember for session
+            /approve always       — approve oldest + remember permanently
+            /approve all always   — approve all + remember permanently
+        """
+        source = event.source
+        session_key = self._session_key_for_source(source)
+
+        from tools.approval import (
+            resolve_gateway_approval, has_blocking_approval,
+        )
+
+        if not has_blocking_approval(session_key):
+            if session_key in self._pending_approvals:
+                self._pending_approvals.pop(session_key)
+                return t("gateway.approval_expired")
+            return t("gateway.approve.no_pending")
+
+        # Parse args: support "all", "all session", "all always", "session", "always"
+        args = event.get_command_args().strip().lower().split()
+        resolve_all = "all" in args
+        remaining = [a for a in args if a != "all"]
+
+        if any(a in {"always", "permanent", "permanently"} for a in remaining):
+            choice = "always"
+        elif any(a in {"session", "ses"} for a in remaining):
+            choice = "session"
+        else:
+            choice = "once"
+
+        count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
+        if not count:
+            return t("gateway.approve.no_pending")
+        self._pending_approvals.pop(session_key, None)
+
+        # Resume typing indicator — agent is about to continue processing.
+        _adapter = self.adapters.get(source.platform)
+        if _adapter:
+            _adapter.resume_typing_for_chat(source.chat_id)
+
+        logger.info("User approved %d dangerous command(s) via /approve (%s)", count, choice)
+        plural = "plural" if count > 1 else "singular"
+        return t(f"gateway.approve.{choice}_{plural}", count=count)
+
+    async def _handle_deny_command(self, event: MessageEvent) -> str:
+        """Handle /deny command — reject pending dangerous command(s).
+
+        Signals blocked agent thread(s) with a 'deny' result so they receive
+        a definitive BLOCKED message, same as the CLI deny flow.
+
+        ``/deny`` denies the oldest; ``/deny all`` denies everything.
+        """
+        source = event.source
+        session_key = self._session_key_for_source(source)
+
+        from tools.approval import (
+            resolve_gateway_approval, has_blocking_approval,
+        )
+
+        if not has_blocking_approval(session_key):
+            if session_key in self._pending_approvals:
+                self._pending_approvals.pop(session_key)
+                return t("gateway.deny.stale")
+            return t("gateway.deny.no_pending")
+
+        args = event.get_command_args().strip().lower()
+        resolve_all = "all" in args
+
+        count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all)
+        if not count:
+            return t("gateway.deny.no_pending")
+        self._pending_approvals.pop(session_key, None)
+
+        # Resume typing indicator — agent continues (with BLOCKED result).
+        _adapter = self.adapters.get(source.platform)
+        if _adapter:
+            _adapter.resume_typing_for_chat(source.chat_id)
+
+        logger.info("User denied %d dangerous command(s) via /deny", count)
+        if count > 1:
+            return t("gateway.deny.denied_plural", count=count)
+        return t("gateway.deny.denied_singular")
 
     # Built-in messaging platforms where the ``/update`` command is allowed.
     # ACP, API server, and webhooks are programmatic interfaces that should
@@ -16811,6 +16948,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
+                self._pending_approvals[_approval_session_key] = {
+                    **approval_data,
+                    "created_at": time.time(),
+                    "source": "blocking_exec_approval",
+                }
 
                 # Redact credentials from the command before displaying it in
                 # the approval prompt — Tirith's findings are already redacted,
@@ -16995,6 +17137,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
             try:
+                message = self._maybe_apply_stale_natural_approval(
+                    _approval_session_key, message
+                )
                 # If _prepare_inbound_message_text buffered image paths for native
                 # attachment, wrap the user turn as an OpenAI-style multimodal
                 # content list. Consume-and-clear so subsequent turns on the same
