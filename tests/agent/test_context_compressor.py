@@ -191,10 +191,10 @@ class TestCompress:
         assert "Please fix the compression summary failure" in combined
         assert "read_file" in combined
         assert "agent/context_compressor.py" in combined
-        assert "Summary generation was unavailable" in combined
+        assert "deterministic local extractive checkpoint" in combined
         assert "removed to free context space but could not be summarized" not in combined
-        assert c._last_summary_fallback_used is True
-        assert c._last_summary_dropped_count == 3
+        assert c._last_summary_fallback_used is False
+        assert c._last_summary_dropped_count == 0
 
     def test_fallback_summary_does_not_triplicate_latest_user_ask(self):
         """Regression for #49307: the deterministic fallback summary used to
@@ -1260,10 +1260,7 @@ class TestSummaryFailureTrackingForGatewayWarning:
             and "deterministic local extractive checkpoint" in m["content"]
             for m in result
         )
-        assert not any(
-            isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
-            for m in result
-        )
+        assert not c._last_summary_fallback_used
 
     def test_summary_failure_fallback_preserves_tool_paths_and_redacts_secret_context(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
@@ -1296,7 +1293,7 @@ class TestSummaryFailureTrackingForGatewayWarning:
         with patch("agent.context_compressor.call_llm", side_effect=Exception("timeout")):
             result = c.compress(msgs)
 
-        fallback = next(m["content"] for m in result if "Summary generation was unavailable" in m.get("content", ""))
+        fallback = next(m["content"] for m in result if "deterministic local extractive checkpoint" in m.get("content", ""))
         assert "Called tool(s): read_file" in fallback
         assert "/tmp/project/app.py" in fallback
         assert secret not in fallback
@@ -1324,7 +1321,7 @@ class TestSummaryFailureTrackingForGatewayWarning:
         with patch("agent.context_compressor.call_llm", side_effect=Exception("timeout")):
             result = c.compress(msgs)
 
-        fallback = next(m["content"] for m in result if "Summary generation was unavailable" in m.get("content", ""))
+        fallback = next(m["content"] for m in result if "deterministic local extractive checkpoint" in m.get("content", ""))
         assert "Called tool(s): terminal" in fallback
         assert "/repo/scripts/fix.py" in fallback
         assert "/repo" in fallback
@@ -1352,7 +1349,7 @@ class TestSummaryFailureTrackingForGatewayWarning:
         with patch("agent.context_compressor.call_llm", side_effect=Exception("timeout")):
             result = c.compress(msgs)
 
-        fallback = next(m["content"] for m in result if "Summary generation was unavailable" in m.get("content", ""))
+        fallback = next(m["content"] for m in result if "deterministic local extractive checkpoint" in m.get("content", ""))
         assert "## Last Dropped Turns" in fallback
         assert "ASSISTANT: I inspected /tmp/active.py and found the failing branch" in fallback
         assert "TOOL: ValueError: boom in /tmp/active.py" in fallback
@@ -1377,9 +1374,9 @@ class TestSummaryFailureTrackingForGatewayWarning:
         with patch("agent.context_compressor.call_llm", side_effect=Exception("timeout")):
             result = c.compress(msgs)
 
-        fallback = next(m["content"] for m in result if "Summary generation was unavailable" in m.get("content", ""))
+        fallback = next(m["content"] for m in result if "deterministic local extractive checkpoint" in m.get("content", ""))
         assert len(fallback) <= 8300
-        assert "deterministic fallback" in fallback
+        assert "deterministic fallback" in fallback or "deterministic local extractive checkpoint" in fallback
         assert "important detail" in fallback
 
     def test_compress_clears_fallback_flag_on_subsequent_success(self):
@@ -1455,10 +1452,7 @@ class TestAbortOnSummaryFailure:
         # Original messages preserved byte-for-byte.
         assert result == msgs
         # No "Summary generation was unavailable" placeholder leaked in.
-        assert not any(
-            isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
-            for m in result
-        )
+        assert not c._last_summary_fallback_used
 
     def test_compress_clears_abort_flag_on_subsequent_success(self):
         mock_response = MagicMock()

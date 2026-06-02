@@ -1557,7 +1557,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
     @staticmethod
     def _shorten_for_extractive_summary(text: Any, limit: int = 500) -> str:
-        rendered = _content_text_for_contains(text).strip()
+        rendered = redact_sensitive_text(_content_text_for_contains(text)).strip()
         rendered = re.sub(r"\s+", " ", rendered)
         if len(rendered) > limit:
             return rendered[: limit - 20].rstrip() + " … " + rendered[-15:].lstrip()
@@ -1619,17 +1619,12 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 if tool_calls:
                     names: list[str] = []
                     for tc in tool_calls:
-                        if isinstance(tc, dict):
-                            fn = tc.get("function", {})
-                            name = fn.get("name", "?")
-                            args = redact_sensitive_text(fn.get("arguments", ""))
-                            if len(args) > 240:
-                                args = args[:220].rstrip() + "..."
-                            names.append(f"{name}({args})" if args else name)
-                        else:
-                            fn = getattr(tc, "function", None)
-                            names.append(getattr(fn, "name", "?") if fn else "?")
-                    event = "ASSISTANT TOOL CALLS: " + "; ".join(names[:6])
+                        name, args = _extract_tool_call_name_and_args(tc)
+                        args = redact_sensitive_text(args)
+                        if len(args) > 240:
+                            args = args[:220].rstrip() + "..."
+                        names.append(f"{name}({args})" if args else name)
+                    event = "Called tool(s): " + "; ".join(names[:6])
                     tool_events.append(event)
                     _append_event(event)
                 elif content:
@@ -1637,8 +1632,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 continue
 
             if role == "tool":
-                tool_id = msg.get("tool_call_id", "?")
-                event = f"TOOL RESULT {tool_id}: {content or '[no text content]'}"
+                event = f"TOOL: {content or '[no text content]'}"
                 tool_events.append(event)
                 _append_event(event)
                 continue
@@ -1658,7 +1652,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         file_lines = "\n".join(f"- `{path}`" for path in paths) if paths else "None detected in compacted span."
         blocker_lines = "\n".join(f"- {line}" for line in error_events[-8:]) if error_events else "None detected in compacted span."
         note = (
-            "The LLM summarizer was unavailable, so this is a deterministic local "
+            "Summary generation was unavailable, so this is a deterministic local "
             "extractive checkpoint from the compacted turns."
         )
         if reason:
@@ -1700,9 +1694,17 @@ Not reliably inferable from local extraction.
 ## Remaining Work
 Continue from the latest protected tail messages after this summary; verify live state before mutating anything.
 
+## Last Dropped Turns
+{completed_lines}
+
 ## Critical Context
-This summary was generated locally because provider-backed context summarization failed. It is extractive and partial, but it preserves recent user/tool/error/path signals instead of dropping the compacted span entirely."""
+This summary was generated locally because provider-backed context summarization failed. It is a deterministic fallback that is extractive and partial, but it preserves recent user/tool/error/path signals instead of dropping the compacted span entirely."""
         body = redact_sensitive_text(body)
+        # redact_sensitive_text intentionally preserves short token prefixes for
+        # diagnostics; fallback summaries should be stricter because they are
+        # re-injected as model-visible context across turns.
+        body = re.sub(r"\b(?:ghp|gho|ghu|ghs)_[A-Za-z0-9._-]+\b", "[REDACTED]", body)
+        body = re.sub(r"\bgithub_pat_[A-Za-z0-9._-]+\b", "[REDACTED]", body)
         if len(body) > self._EXTRACTIVE_FALLBACK_MAX_CHARS:
             body = body[: self._EXTRACTIVE_FALLBACK_MAX_CHARS].rstrip() + "\n...[local extractive summary truncated]"
         self._previous_summary = body
