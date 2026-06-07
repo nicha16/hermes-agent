@@ -9,6 +9,7 @@ import {
   matchesAllowedUser,
   normalizeWhatsAppIdentifier,
   parseAllowedUsers,
+  shouldBypassAllowlistForInboxMode,
 } from './allowlist.js';
 
 test('normalizeWhatsAppIdentifier strips jid syntax and plus prefix', () => {
@@ -77,4 +78,30 @@ test('matchesAllowedUser rejects everyone when allowlist is empty (#8389)', () =
   } finally {
     rmSync(sessionDir, { recursive: true, force: true });
   }
+});
+
+test('shouldBypassAllowlistForInboxMode lets inbox triage see normal incoming messages', () => {
+  assert.equal(
+    shouldBypassAllowlistForInboxMode({ inboxMode: true, chatId: '12345@s.whatsapp.net', fromMe: false }),
+    true,
+  );
+  assert.equal(
+    shouldBypassAllowlistForInboxMode({ inboxMode: true, chatId: '99999@g.us', fromMe: false }),
+    true,
+  );
+});
+
+test('shouldBypassAllowlistForInboxMode does not bypass status broadcasts or non-inbox mode', () => {
+  assert.equal(
+    shouldBypassAllowlistForInboxMode({ inboxMode: true, chatId: 'status@broadcast', fromMe: false }),
+    false,
+  );
+  assert.equal(
+    shouldBypassAllowlistForInboxMode({ inboxMode: false, chatId: '12345@s.whatsapp.net', fromMe: false }),
+    false,
+  );
+  assert.equal(
+    shouldBypassAllowlistForInboxMode({ inboxMode: true, chatId: '12345@s.whatsapp.net', fromMe: true }),
+    false,
+  );
 });

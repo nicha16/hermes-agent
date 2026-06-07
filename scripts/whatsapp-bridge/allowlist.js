@@ -86,3 +86,19 @@ export function matchesAllowedUser(senderId, allowedUsers, sessionDir) {
 
   return false;
 }
+
+export function shouldBypassAllowlistForInboxMode({ inboxMode, chatId, fromMe = false } = {}) {
+  if (!inboxMode || fromMe) {
+    return false;
+  }
+
+  // Status/broadcast updates are not user inbox conversations and should not
+  // be forwarded into Hermes triage even when inbox mode bypasses sender
+  // allowlists for normal DMs/groups.
+  const normalizedChatId = String(chatId || '').trim().toLowerCase();
+  if (!normalizedChatId || normalizedChatId === 'status@broadcast' || normalizedChatId.endsWith('@broadcast')) {
+    return false;
+  }
+
+  return true;
+}

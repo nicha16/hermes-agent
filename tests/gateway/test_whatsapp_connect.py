@@ -185,6 +185,40 @@ class TestDataInitialized:
 
 
 # ---------------------------------------------------------------------------
+# Bridge subprocess environment
+# ---------------------------------------------------------------------------
+
+class TestBridgeSubprocessEnvironment:
+    """Verify config-only WhatsApp intent reaches the Node bridge runtime."""
+
+    @pytest.mark.asyncio
+    async def test_config_inbox_mode_is_passed_to_bridge_env(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {"inbox_mode": True}
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_client_cls = _mock_aiohttp(status=503)
+        mock_fh = MagicMock()
+
+        with patch("gateway.platforms.whatsapp.check_whatsapp_requirements", return_value=True), \
+             patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "mkdir", return_value=None), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0)), \
+             patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
+             patch("builtins.open", return_value=mock_fh), \
+             patch("gateway.platforms.whatsapp.asyncio.sleep", new_callable=AsyncMock), \
+             patch("gateway.platforms.whatsapp.asyncio.create_task"), \
+             patch("aiohttp.ClientSession", _mock_aiohttp(status=503)), \
+             patch.dict("os.environ", {}, clear=True):
+            result = await adapter.connect()
+
+        assert result is False
+        bridge_env = mock_popen.call_args.kwargs["env"]
+        assert bridge_env["WHATSAPP_INBOX_MODE"] == "true"
+
+
+# ---------------------------------------------------------------------------
 # File handle cleanup on error paths
 # ---------------------------------------------------------------------------
 

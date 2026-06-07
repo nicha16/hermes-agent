@@ -607,14 +607,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             self._bridge_log_fh = bridge_log_fh
 
             # Build bridge subprocess environment.
-            # Pass WHATSAPP_REPLY_PREFIX from config.yaml so the Node bridge
-            # can use it without the user needing to set a separate env var.
-            # with_hermes_node_path() copies os.environ when called with no arg.
+            # Pass WhatsApp runtime settings from config.yaml so the Node bridge
+            # sees the same inbox/formatting/cache intent as the Python adapter
+            # even when operators do not export separate environment variables.
+            # with_hermes_node_path() copies os.environ and injects Hermes' Node path.
             bridge_env = with_hermes_node_path()
             if self._reply_prefix is not None:
                 bridge_env["WHATSAPP_REPLY_PREFIX"] = self._reply_prefix
+            inbox_mode = self.config.extra.get("inbox_mode")
+            if inbox_mode is not None and "WHATSAPP_INBOX_MODE" not in bridge_env:
+                bridge_env["WHATSAPP_INBOX_MODE"] = str(inbox_mode).lower()
             # Pass the profile-aware cache directories so the bridge writes
-            # media where the Python side reads it.  Without these the bridge
+            # media where the Python side reads it. Without these the bridge
             # hardcodes ~/.hermes/{image,audio,document}_cache, which diverges
             # under HERMES_HOME overrides, profiles, and the new cache/ layout.
             from gateway.platforms.base import (

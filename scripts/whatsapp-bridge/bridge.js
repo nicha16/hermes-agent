@@ -29,7 +29,7 @@ import { randomBytes, createHash } from 'crypto';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
-import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { matchesAllowedUser, parseAllowedUsers, shouldBypassAllowlistForInboxMode } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 
@@ -90,6 +90,12 @@ try {
 const PAIR_ONLY = args.includes('--pair-only');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
+const WHATSAPP_INBOX_MODE = (() => {
+  const envValue = process.env.WHATSAPP_INBOX_MODE;
+  if (typeof envValue === 'string' && ['1', 'true', 'yes', 'on'].includes(envValue.toLowerCase())) return true;
+  if (typeof envValue === 'string' && ['0', 'false', 'no', 'off'].includes(envValue.toLowerCase())) return false;
+  return readEnvFlagFromFile('WHATSAPP_INBOX_MODE') === true;
+})();
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
@@ -113,6 +119,32 @@ function enqueueSend(fn) {
   const task = _sendQueue.then(() => fn(), () => fn());
   _sendQueue = task.catch(() => {});
   return task;
+}
+
+function readEnvFlagFromFile(name) {
+  const home = process.env.HERMES_HOME || path.join(process.env.HOME || '~', '.hermes');
+  const envPath = path.join(home, '.env');
+  try {
+    const content = readFileSync(envPath, 'utf8');
+    for (const rawLine of content.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const normalized = line.startsWith('export ') ? line.slice('export '.length).trim() : line;
+      const idx = normalized.indexOf('=');
+      if (idx === -1) continue;
+      const key = normalized.slice(0, idx).trim();
+      if (key !== name) continue;
+      const value = normalized.slice(idx + 1).trim().replace(/^[\'\"]|[\'\"]$/g, '').toLowerCase();
+      if (['false', '0', 'no', 'off'].includes(value)) return false;
+      if (['true', '1', 'yes', 'on'].includes(value)) return true;
+    }
+  } catch {}
+  return undefined;
+}
+
+if (readEnvFlagFromFile('WHATSAPP_ENABLED') === false) {
+  console.log('WhatsApp bridge disabled by WHATSAPP_ENABLED=false in .env; exiting before connecting.');
+  process.exit(42);
 }
 
 function sleep(ms) {
@@ -378,9 +410,17 @@ async function startSocket() {
       // Self-chat mode only responds to the user's own messages to
       // themselves — stranger DMs / group pings must never reach the
       // Python gateway, otherwise a pairing-code reply fires in response
-      // to arbitrary incoming messages (#8389).
+      // to arbitrary incoming messages (#8389). In inbox mode, however,
+      // the Python gateway/triage layer must see normal inbound DMs/groups
+      // before deciding whether to notify; bridge-side allowlist is still
+      // applied outside inbox mode and for status/broadcast traffic.
       if (!msg.key.fromMe) {
-        if (WHATSAPP_MODE === 'self-chat') {
+        const bypassAllowlist = shouldBypassAllowlistForInboxMode({
+          inboxMode: WHATSAPP_INBOX_MODE,
+          chatId,
+          fromMe: msg.key.fromMe,
+        });
+        if (WHATSAPP_MODE === 'self-chat' && !bypassAllowlist) {
           try {
             console.log(JSON.stringify({
               event: 'ignored',
@@ -391,7 +431,7 @@ async function startSocket() {
           } catch {}
           continue;
         }
-        if (!matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
+        if (!bypassAllowlist && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
           try {
             console.log(JSON.stringify({
               event: 'ignored',
@@ -741,20 +781,14 @@ app.post('/send-media', async (req, res) => {
   }
 });
 
-// Typing indicator
+// Typing indicator — intentionally a privacy no-op per canary invariant.
+// Do NOT emit WhatsApp presence updates here; the /typing canary asserts this path stays inert.
 app.post('/typing', async (req, res) => {
-  if (!sock || connectionState !== 'connected') {
-    return res.status(503).json({ error: 'Not connected' });
-  }
-
-  const { chatId } = req.body;
-  if (!chatId) return res.status(400).json({ error: 'chatId required' });
-
   try {
-    await sock.sendPresenceUpdate('composing', chatId);
-    res.json({ success: true });
-  } catch (err) {
-    res.json({ success: false });
+    // Privacy no-op: do not call sendPresenceUpdate or any WhatsApp presence API.
+    res.json({ success: true, skipped: true, reason: 'privacy_noop' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -783,10 +817,23 @@ app.get('/chat/:id', async (req, res) => {
   });
 });
 
+function getEffectiveInboundTriage() {
+  if (WHATSAPP_INBOX_MODE) {
+    return 'enabled';
+  }
+  if (WHATSAPP_MODE === 'bot' && ALLOWED_USERS.size > 0) {
+    return 'allowlist_only';
+  }
+  return 'self_chat_only';
+}
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({
     status: connectionState,
+    mode: WHATSAPP_MODE,
+    inboxMode: WHATSAPP_INBOX_MODE,
+    effectiveInboundTriage: getEffectiveInboundTriage(),
     queueLength: messageQueue.length,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
@@ -802,9 +849,15 @@ if (PAIR_ONLY) {
   startSocket();
 } else {
   app.listen(PORT, '127.0.0.1', () => {
-    console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
+    console.log(
+      `🌉 WhatsApp bridge listening on port ${PORT} `
+      + `(mode: ${WHATSAPP_MODE}, inboxMode: ${WHATSAPP_INBOX_MODE}, `
+      + `effectiveInboundTriage: ${getEffectiveInboundTriage()})`
+    );
     console.log(`📁 Session stored in: ${SESSION_DIR}`);
-    if (ALLOWED_USERS.size > 0) {
+    if (WHATSAPP_INBOX_MODE) {
+      console.log('📥 Inbox triage enabled — normal inbound DMs/groups are forwarded to Python triage; status/broadcast traffic stays excluded.');
+    } else if (ALLOWED_USERS.size > 0) {
       console.log(`🔒 Allowed users: ${Array.from(ALLOWED_USERS).join(', ')}`);
     } else if (WHATSAPP_MODE === 'self-chat') {
       console.log(`🔒 Self-chat mode — only your own messages to yourself are processed.`);
