@@ -1976,12 +1976,10 @@ class GatewaySlashCommandsMixin:
         _quick_key = self._session_key_for_source(event.source) if event.source else None
         if adapter and _quick_key:
             try:
-                kickoff_event = MessageEvent(
+                kickoff_event = dataclasses.replace(
+                    event,
                     text=state.goal,
                     message_type=MessageType.TEXT,
-                    source=event.source,
-                    message_id=event.message_id,
-                    channel_prompt=event.channel_prompt,
                 )
                 self._enqueue_fifo(_quick_key, kickoff_event, adapter)
             except Exception as exc:
