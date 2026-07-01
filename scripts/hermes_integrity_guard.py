@@ -97,6 +97,18 @@ CONTENT_MUST_CONTAIN = [
     ("plugins/platforms/telegram/adapter.py",
      r"streaming",
      "Telegram streaming opt-in"),
+    # ── add new content checks above this line ──────────────────────────────
+    # ── cross-file dataclass contract ───────────────────────────────────────
+    # reply_to_is_native_quote must exist in base.py MessageEvent dataclass
+    # because plugins/platforms/telegram/adapter.py passes it as a kwarg.
+    # Removal causes TypeError on every inbound Telegram message.
+    ("gateway/platforms/base.py",
+     r"reply_to_is_native_quote",
+     "reply_to_is_native_quote field in MessageEvent"),
+    # dataclass kwarg contract checker must be present
+    ("scripts/dataclass_kwarg_contract_check.py",
+     r"MessageEvent",
+     "dataclass kwarg contract checker"),
 ]
 
 
