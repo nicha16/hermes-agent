@@ -72,10 +72,18 @@ class DeepSeekProfile(ProviderProfile):
         # Effort mapping.  Pass low/medium/high through; xhigh/max → max.
         # When no effort is set we omit reasoning_effort so DeepSeek applies
         # its server default (currently high).
+        #
+        # Pro models get clamped to high (even when config says max) —
+        # they serve as fallback for cron triage where max reasoning is
+        # unnecessary overhead. Flash keeps the full configured effort.
         if isinstance(reasoning_config, dict):
             effort = (reasoning_config.get("effort") or "").strip().lower()
             if effort in {"xhigh", "max"}:
-                top_level["reasoning_effort"] = "max"
+                _m = (model or "").strip().lower()
+                if "deepseek-v4-pro" in _m:
+                    top_level["reasoning_effort"] = "high"
+                else:
+                    top_level["reasoning_effort"] = "max"
             elif effort in {"low", "medium", "high"}:
                 top_level["reasoning_effort"] = effort
 

@@ -48,6 +48,8 @@ class KimiProfile(ProviderProfile):
         effort = (reasoning_config.get("effort") or "").strip().lower()
         if effort in {"low", "medium", "high"}:
             top_level["reasoning_effort"] = effort
+        elif effort in {"xhigh", "max"}:
+            top_level["reasoning_effort"] = "high"
         else:
             extra_body["thinking"] = {"type": "enabled"}
 

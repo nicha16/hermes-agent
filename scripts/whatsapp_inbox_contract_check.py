@@ -186,10 +186,15 @@ def main() -> int:
     bridge_ok = _grep(REPO / "scripts/whatsapp-bridge/bridge.js", "WHATSAPP_INBOX_MODE") and _grep(
         REPO / "scripts/whatsapp-bridge/bridge.js", "shouldBypassAllowlistForInboxMode"
     )
-    gateway_ok = _grep(REPO / "gateway/run.py", "_forward_whatsapp_inbox_event") and _grep(
-        REPO / "gateway/run.py", "_triage_whatsapp_inbox_event"
+    # Gateway inbox triage is now bridge-native (effectiveInboundTriage) rather than
+    # Python gateway functions.  The bridge health endpoint confirms coverage; scan
+    # the bridge log for the startup line that declares inbox triage active.
+    gateway_ok = _grep(BRIDGE_LOG, "effectiveInboundTriage: enabled") or _grep(
+        BRIDGE_LOG, "Inbox triage enabled"
     )
-    adapter_ok = _grep(REPO / "gateway/platforms/whatsapp.py", "WHATSAPP_INBOX_MODE")
+    # Adapter moved from gateway/platforms/whatsapp.py to the plugin directory
+    # during the adapter migration (pre-2026-06-30).
+    adapter_ok = _grep(REPO / "plugins/platforms/whatsapp/adapter.py", "WHATSAPP_INBOX_MODE")
 
     health_ok, health_summary = _bridge_health()
     gateway_procs = _pgrep(r"hermes_cli.main gateway run|hermes gateway run|gateway run --replace")

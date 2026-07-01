@@ -2042,6 +2042,11 @@ DEFAULT_CONFIG = {
     "memory": {
         "memory_enabled": True,
         "user_profile_enabled": True,
+        # Expose the built-in memory writer tool. Set false to keep MEMORY.md /
+        # USER.md read-injected as compact bootloader context while hiding the
+        # writer; external memory provider tools remain governed by the memory
+        # toolset and provider config.
+        "builtin_writer_enabled": True,
         # Approval gate for memory writes (add/replace/remove), applied to BOTH
         # foreground agent turns and the background self-improvement review fork
         # (the source of unprompted "wrong assumption" saves users reported).
