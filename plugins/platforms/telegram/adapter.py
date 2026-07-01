@@ -13,9 +13,11 @@ import inspect
 import json
 import logging
 import os
+import sqlite3
+import tempfile
 import html as _html
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Any
 
 logger = logging.getLogger(__name__)
@@ -92,6 +94,7 @@ from plugins.platforms.telegram.telegram_network import (
     parse_fallback_ip_env,
 )
 from utils import atomic_replace, env_float, env_int
+from hermes_constants import get_hermes_home
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
@@ -109,6 +112,165 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
     ".gif": "image/gif",
 }
 
+
+MAX_COMMANDS_PER_SCOPE = 30
+
+
+class TelegramMessageLedger:
+    """SQLite cache of Telegram messages keyed by chat/message id.
+
+    Telegram replies can arrive long after the gateway session that contained
+    the original message has reset.  The Bot API gives deterministic chat and
+    message ids, so quote recovery belongs at the platform boundary rather
+    than in transcript search or model memory.
+    """
+
+    DEFAULT_RETENTION_DAYS = 180
+    DEFAULT_MAX_ROWS = 50_000
+
+    _CREATE_TABLE_SQL = """
+        CREATE TABLE IF NOT EXISTS telegram_message_cache (
+            platform TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            thread_id TEXT,
+            message_id TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            sender_name TEXT,
+            text_or_caption TEXT,
+            session_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (platform, chat_id, message_id)
+        )
+    """
+
+    def __init__(
+        self,
+        db_path: Optional[str | _Path] = None,
+        *,
+        retention_days: Optional[int] = None,
+        max_rows: Optional[int] = None,
+    ):
+        self.db_path = _Path(db_path) if db_path is not None else get_hermes_home() / "state.db"
+        self.retention_days = self._non_negative_int(
+            retention_days, self.DEFAULT_RETENTION_DAYS
+        )
+        self.max_rows = self._non_negative_int(max_rows, self.DEFAULT_MAX_ROWS)
+
+    def _connect(self) -> sqlite3.Connection:
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self.db_path), timeout=5.0)
+        conn.execute(self._CREATE_TABLE_SQL)
+        return conn
+
+    @staticmethod
+    def _clean(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value)
+        return text if text.strip() else None
+
+    @staticmethod
+    def _non_negative_int(value: Any, default: int) -> int:
+        if value is None:
+            return default
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(0, parsed)
+
+    def _prune(self, conn: sqlite3.Connection, now: datetime) -> None:
+        if self.retention_days > 0:
+            cutoff = (now - timedelta(days=self.retention_days)).isoformat()
+            conn.execute(
+                "DELETE FROM telegram_message_cache WHERE updated_at < ?",
+                (cutoff,),
+            )
+        if self.max_rows > 0:
+            conn.execute(
+                """
+                DELETE FROM telegram_message_cache
+                WHERE rowid IN (
+                    SELECT rowid
+                    FROM telegram_message_cache
+                    ORDER BY updated_at DESC, created_at DESC, rowid DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (self.max_rows,),
+            )
+
+    def record_message(
+        self,
+        *,
+        chat_id: Any,
+        message_id: Any,
+        direction: str,
+        text_or_caption: Any,
+        thread_id: Any = None,
+        sender_name: Any = None,
+        session_id: Any = None,
+        platform: str = "telegram",
+    ) -> None:
+        chat_id_s = self._clean(chat_id)
+        message_id_s = self._clean(message_id)
+        text_s = self._clean(text_or_caption)
+        if not chat_id_s or not message_id_s or not text_s:
+            return
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO telegram_message_cache (
+                    platform, chat_id, thread_id, message_id, direction,
+                    sender_name, text_or_caption, session_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform, chat_id, message_id) DO UPDATE SET
+                    thread_id=excluded.thread_id,
+                    direction=excluded.direction,
+                    sender_name=excluded.sender_name,
+                    text_or_caption=excluded.text_or_caption,
+                    session_id=excluded.session_id,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    platform,
+                    chat_id_s,
+                    self._clean(thread_id),
+                    message_id_s,
+                    str(direction or "unknown"),
+                    self._clean(sender_name),
+                    text_s,
+                    self._clean(session_id),
+                    now,
+                    now,
+                ),
+            )
+            self._prune(conn, now_dt)
+
+    def lookup_text(
+        self,
+        chat_id: Any,
+        message_id: Any,
+        *,
+        platform: str = "telegram",
+    ) -> Optional[str]:
+        chat_id_s = self._clean(chat_id)
+        message_id_s = self._clean(message_id)
+        if not chat_id_s or not message_id_s:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT text_or_caption
+                FROM telegram_message_cache
+                WHERE platform = ? AND chat_id = ? AND message_id = ?
+                """,
+                (platform, chat_id_s, message_id_s),
+            ).fetchone()
+        return row[0] if row and self._clean(row[0]) else None
 
 def check_telegram_requirements() -> bool:
     """Check if Telegram dependencies are available.
@@ -491,6 +653,272 @@ class TelegramAdapter(BasePlatformAdapter):
         # Tracks status bubbles owned by this adapter so subsequent calls with the
         # same key edit the same message instead of appending new ones (#30045).
         self._status_message_ids: Dict[tuple, str] = {}
+        self._message_ledger = self._new_telegram_message_ledger()
+
+    def _new_telegram_message_ledger(self) -> TelegramMessageLedger:
+        extra = self.config.extra or {}
+        return TelegramMessageLedger(
+            retention_days=extra.get(
+                "telegram_message_cache_retention_days",
+                extra.get("quote_cache_retention_days"),
+            ),
+            max_rows=extra.get(
+                "telegram_message_cache_max_rows",
+                extra.get("quote_cache_max_rows"),
+            ),
+        )
+
+    def _telegram_message_ledger(self) -> TelegramMessageLedger:
+        ledger = getattr(self, "_message_ledger", None)
+        if ledger is None:
+            ledger = self._new_telegram_message_ledger()
+            self._message_ledger = ledger
+        return ledger
+
+    def _record_telegram_message(
+        self,
+        *,
+        chat_id: Any,
+        message_id: Any,
+        direction: str,
+        text_or_caption: Any,
+        thread_id: Any = None,
+        sender_name: Any = None,
+        session_id: Any = None,
+    ) -> None:
+        try:
+            self._telegram_message_ledger().record_message(
+                chat_id=chat_id,
+                thread_id=thread_id,
+                message_id=message_id,
+                direction=direction,
+                text_or_caption=text_or_caption,
+                sender_name=sender_name,
+                session_id=session_id,
+            )
+        except Exception:
+            logger.debug("[%s] Telegram message ledger record failed", self.name, exc_info=True)
+
+    @staticmethod
+    def _telegram_text_or_caption(message: Any, fallback: Any = None) -> Optional[str]:
+        """Return the text Telegram says it stored, falling back to our payload."""
+        for attr in ("text", "caption"):
+            value = getattr(message, attr, None) if message is not None else None
+            if value is not None and str(value).strip():
+                return str(value)
+        if fallback is not None and str(fallback).strip():
+            return str(fallback)
+        return None
+
+    def _record_outbound_telegram_message(
+        self,
+        *,
+        chat_id: Any,
+        message_id: Any,
+        text_or_caption: Any,
+        metadata: Optional[Dict[str, Any]] = None,
+        thread_id: Any = None,
+    ) -> None:
+        self._record_telegram_message(
+            chat_id=str(chat_id),
+            thread_id=thread_id if thread_id is not None else self._metadata_thread_id(metadata),
+            message_id=str(message_id),
+            direction="outbound",
+            text_or_caption=text_or_caption,
+            sender_name="Keira",
+            session_id=os.getenv("HERMES_SESSION_ID"),
+        )
+
+    def _record_sent_telegram_message(
+        self,
+        *,
+        chat_id: Any,
+        sent_message: Any,
+        fallback_text: Any,
+        metadata: Optional[Dict[str, Any]] = None,
+        thread_id: Any = None,
+    ) -> Optional[str]:
+        message_id = getattr(sent_message, "message_id", None)
+        if message_id is None:
+            return None
+        message_id_s = str(message_id)
+        self._record_outbound_telegram_message(
+            chat_id=chat_id,
+            thread_id=thread_id,
+            message_id=message_id_s,
+            text_or_caption=self._telegram_text_or_caption(sent_message, fallback_text),
+            metadata=metadata,
+        )
+        return message_id_s
+
+    def _lookup_telegram_message_text(self, chat_id: Any, message_id: Any) -> Optional[str]:
+        try:
+            return self._telegram_message_ledger().lookup_text(chat_id, message_id)
+        except Exception:
+            logger.debug("[%s] Telegram message ledger lookup failed", self.name, exc_info=True)
+            return None
+
+    @staticmethod
+    def _telegram_message_id_for_api(message_id: Any) -> Any:
+        try:
+            return int(str(message_id))
+        except (TypeError, ValueError):
+            return message_id
+
+    @staticmethod
+    def _telegram_api_kwargs(obj: Any) -> Dict[str, Any]:
+        api_kwargs = getattr(obj, "api_kwargs", None)
+        return api_kwargs if isinstance(api_kwargs, dict) else {}
+
+    @classmethod
+    def _telegram_quote_text_from_obj(cls, obj: Any) -> Optional[str]:
+        """Return TextQuote text from PTB attributes or preserved raw API JSON.
+
+        PTB generally exposes Bot API ``quote`` as ``obj.quote.text`` on
+        ``Message``.  When Telegram adds/reshapes quote-bearing fields before
+        PTB models them fully, the raw JSON can survive in ``api_kwargs``.  Old
+        Telegram replies can also surface through ``external_reply`` with the
+        selected quote nested under that object's raw API kwargs.  Treat those as
+        first-class quote sources rather than dropping back to unavailable.
+        """
+        if obj is None:
+            return None
+        quote = getattr(obj, "quote", None)
+        text = getattr(quote, "text", None) if quote is not None else None
+        if text and str(text).strip():
+            return str(text)
+        raw_quote = cls._telegram_api_kwargs(obj).get("quote")
+        if isinstance(raw_quote, dict):
+            text = raw_quote.get("text")
+        else:
+            text = getattr(raw_quote, "text", None)
+        if text and str(text).strip():
+            return str(text)
+        return None
+
+    def _quote_recovery_forward_enabled(self) -> bool:
+        raw = self.config.extra.get("quote_recovery_forward", False)
+        if isinstance(raw, str):
+            return raw.strip().lower() not in {"0", "false", "no", "off"}
+        return bool(raw)
+
+    def _quote_recovery_forward_chat_id(self, source: Any) -> Optional[str]:
+        explicit = (
+            self.config.extra.get("quote_recovery_forward_chat_id")
+            or self.config.extra.get("telegram_quote_recovery_forward_chat_id")
+        )
+        if explicit is not None and str(explicit).strip():
+            return str(explicit)
+        user_id = getattr(source, "user_id", None)
+        return str(user_id) if user_id is not None and str(user_id).strip() else None
+
+    @staticmethod
+    def _reply_recovery_from_chat_id(event: Any) -> Optional[str]:
+        raw_message = getattr(event, "raw_message", None)
+        external_reply = getattr(raw_message, "external_reply", None)
+        external_reply_id = getattr(external_reply, "message_id", None)
+        if external_reply_id is not None and str(external_reply_id) == str(getattr(event, "reply_to_message_id", "")):
+            external_chat = getattr(external_reply, "chat", None)
+            external_chat_id = getattr(external_chat, "id", None)
+            if external_chat_id is not None and str(external_chat_id).strip():
+                return str(external_chat_id)
+        source = getattr(event, "source", None)
+        from_chat_id = getattr(source, "chat_id", None)
+        return str(from_chat_id) if from_chat_id is not None and str(from_chat_id).strip() else None
+
+    async def _recover_unavailable_reply_text_via_forward(
+        self,
+        event: "MessageEvent",
+    ) -> "MessageEvent":
+        """Try to recover a missing Telegram reply target via Bot API forwarding.
+
+        Bot API has no silent arbitrary get-message endpoint.  For a known
+        ``chat_id`` + ``reply_to_message_id``, however, ``forwardMessage`` can
+        return a fresh ``Message`` object containing the original text/caption.
+        We forward to the quoting user's DM (or an explicit configured sink),
+        delete the temporary copy immediately, then cache the recovered original
+        message text in the ledger so subsequent replies do not need forwarding.
+        """
+        marker = "[Replying to unavailable Telegram message:"
+        if not event or not getattr(event, "reply_to_message_id", None):
+            return event
+        current_reply_text = str(getattr(event, "reply_to_text", "") or "")
+        if current_reply_text and not current_reply_text.startswith(marker):
+            return event
+        if not self._quote_recovery_forward_enabled() or not self._bot:
+            return event
+
+        source = getattr(event, "source", None)
+        from_chat_id = self._reply_recovery_from_chat_id(event)
+        recovery_chat_id = self._quote_recovery_forward_chat_id(source)
+        reply_to_id = getattr(event, "reply_to_message_id", None)
+        if not from_chat_id or not recovery_chat_id or not reply_to_id:
+            return event
+
+        forwarded = None
+        temp_message_id = None
+        try:
+            forwarded = await self._bot.forward_message(
+                chat_id=str(recovery_chat_id),
+                from_chat_id=str(from_chat_id),
+                message_id=self._telegram_message_id_for_api(reply_to_id),
+                disable_notification=True,
+            )
+            temp_message_id = getattr(forwarded, "message_id", None)
+            recovered_text = (
+                getattr(forwarded, "text", None)
+                or getattr(forwarded, "caption", None)
+                or None
+            )
+            if recovered_text and str(recovered_text).strip():
+                event.reply_to_text = str(recovered_text)
+                self._record_telegram_message(
+                    chat_id=str(from_chat_id),
+                    thread_id=getattr(source, "thread_id", None),
+                    message_id=str(reply_to_id),
+                    direction="forward_recovered",
+                    text_or_caption=event.reply_to_text,
+                    sender_name="Telegram forward recovery",
+                    session_id=os.getenv("HERMES_SESSION_ID"),
+                )
+                logger.info(
+                    "[%s] Recovered Telegram reply text via forward fallback: chat=%s message_id=%s",
+                    self.name,
+                    from_chat_id,
+                    reply_to_id,
+                )
+        except Exception:
+            logger.debug(
+                "[%s] Telegram quote forward recovery failed: chat=%s message_id=%s",
+                self.name,
+                from_chat_id,
+                reply_to_id,
+                exc_info=True,
+            )
+        finally:
+            if temp_message_id is not None:
+                try:
+                    await self._bot.delete_message(
+                        chat_id=str(recovery_chat_id),
+                        message_id=self._telegram_message_id_for_api(temp_message_id),
+                    )
+                except Exception:
+                    logger.warning(
+                        "[%s] Failed to delete temporary Telegram quote recovery forward: chat=%s message_id=%s",
+                        self.name,
+                        recovery_chat_id,
+                        temp_message_id,
+                        exc_info=True,
+                    )
+        return event
+
+    @staticmethod
+    def _unavailable_reply_marker(chat_id: Any, thread_id: Any, message_id: Any) -> str:
+        thread_part = f" thread={thread_id}" if thread_id is not None else ""
+        return (
+            f"[Replying to unavailable Telegram message: chat={chat_id}{thread_part} "
+            f"message_id={message_id}. Quote text was not available.]"
+        )
 
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
@@ -3019,6 +3447,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 _TimedOut = None  # type: ignore[assignment,misc]
 
             for i, chunk in enumerate(chunks):
+                sent_text_for_ledger = chunk
                 retried_thread_not_found = False
                 metadata_reply_to = self._metadata_reply_to_message_id(metadata)
                 private_dm_topic_send = self._is_private_dm_topic_send(chat_id, thread_id, metadata)
@@ -3080,6 +3509,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
                                 logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
                                 plain_chunk = _strip_mdv2(chunk)
+                                sent_text_for_ledger = plain_chunk
                                 msg = await self._bot.send_message(
                                     chat_id=normalize_telegram_chat_id(chat_id),
                                     text=plain_chunk,
@@ -3206,7 +3636,18 @@ class TelegramAdapter(BasePlatformAdapter):
                                 await asyncio.sleep(wait)
                                 continue
                         raise
-                message_ids.append(str(msg.message_id))
+                if msg is None:
+                    raise RuntimeError("Telegram send completed without a message object")
+                sent_message_id = self._record_sent_telegram_message(
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    sent_message=msg,
+                    fallback_text=_strip_mdv2(sent_text_for_ledger),
+                    metadata=metadata,
+                )
+                if not sent_message_id:
+                    raise RuntimeError("Telegram send completed without a message id")
+                message_ids.append(sent_message_id)
 
             # Re-trigger typing indicator after sending a message.
             # Telegram clears the typing state when a new message is delivered,
@@ -3356,6 +3797,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id=int(message_id),
                     text=content,
                 )
+                self._record_outbound_telegram_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text_or_caption=content,
+                    metadata=metadata,
+                )
                 return SendResult(success=True, message_id=message_id)
 
             formatted = self.format_message(content)
@@ -3369,6 +3816,12 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception as fmt_err:
                 # "Message is not modified" is a no-op, not an error
                 if "not modified" in str(fmt_err).lower():
+                    self._record_outbound_telegram_message(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text_or_caption=content,
+                        metadata=metadata,
+                    )
                     return SendResult(success=True, message_id=message_id)
                 # Fallback: strip MarkdownV2 escapes and retry as clean plain text
                 logger.warning(
@@ -3382,11 +3835,23 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id=int(message_id),
                     text=_plain,
                 )
+            self._record_outbound_telegram_message(
+                chat_id=chat_id,
+                message_id=message_id,
+                text_or_caption=content,
+                metadata=metadata,
+            )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
             # "Message is not modified" — content identical, treat as success
             if "not modified" in err_str:
+                self._record_outbound_telegram_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text_or_caption=content,
+                    metadata=metadata,
+                )
                 return SendResult(success=True, message_id=message_id)
             # Reactive split-and-deliver: parse_mode formatting can inflate
             # the payload past the limit even when the raw text was under
@@ -3426,6 +3891,12 @@ class TelegramAdapter(BasePlatformAdapter):
                         chat_id=normalize_telegram_chat_id(chat_id),
                         message_id=int(message_id),
                         text=content,
+                    )
+                    self._record_outbound_telegram_message(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text_or_caption=content,
+                        metadata=metadata,
                     )
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
@@ -3563,6 +4034,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 return SendResult(success=False, error=str(e))
 
+        self._record_outbound_telegram_message(
+            chat_id=chat_id,
+            message_id=message_id,
+            text_or_caption=first_chunk,
+            metadata=metadata,
+        )
+
         # Step 2 — send each remaining chunk as a continuation message,
         # threaded as a reply to the previous so the user sees them as a
         # contiguous block.  We call self._bot.send_message directly so the
@@ -3674,6 +4152,13 @@ class TelegramAdapter(BasePlatformAdapter):
             new_id = str(getattr(sent_msg, "message_id", "")) or prev_id
             continuation_ids.append(new_id)
             delivered_chunks.append(chunk)
+            self._record_sent_telegram_message(
+                chat_id=chat_id,
+                thread_id=thread_id,
+                sent_message=sent_msg,
+                fallback_text=_strip_mdv2(chunk),
+                metadata=metadata,
+            )
             prev_id = new_id
 
         last_id = continuation_ids[-1] if continuation_ids else message_id
@@ -4610,6 +5095,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mm:", "mc:", "mb", "mx", "mg:")):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to change models.")
+                return
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
@@ -6725,6 +7220,7 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(update.message)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+        event = await self._recover_unavailable_reply_text_via_forward(event)
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
@@ -6747,6 +7243,7 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
+        event = await self._recover_unavailable_reply_text_via_forward(event)
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
@@ -6795,6 +7292,7 @@ class TelegramAdapter(BasePlatformAdapter):
         parts.append("Ask what they'd like to find nearby (restaurants, cafes, etc.) and any preferences.")
 
         event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
+        event = await self._recover_unavailable_reply_text_via_forward(event)
         event.text = "\n".join(parts)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
@@ -6971,6 +7469,7 @@ class TelegramAdapter(BasePlatformAdapter):
         msg_type = self._media_message_type(msg)
 
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
+        event = await self._recover_unavailable_reply_text_via_forward(event)
         
         # Add caption as text
         if msg.caption:
@@ -7610,17 +8109,53 @@ class TelegramAdapter(BasePlatformAdapter):
         # / caption when no native quote is present.
         reply_to_id = None
         reply_to_text = None
+        reply_to_is_native_quote = False
+        reply_lookup_chat_id = str(chat.id)
+        external_reply = getattr(message, "external_reply", None)
+        quote_text = (
+            self._telegram_quote_text_from_obj(message)
+            or self._telegram_quote_text_from_obj(external_reply)
+        )
+        if quote_text:
+            reply_to_text = quote_text
+            reply_to_is_native_quote = True
         if message.reply_to_message:
             reply_to_id = str(message.reply_to_message.message_id)
-            quote = getattr(message, "quote", None)
-            quote_text = getattr(quote, "text", None) if quote is not None else None
-            if quote_text:
-                reply_to_text = quote_text
-            else:
-                reply_to_text = (
-                    message.reply_to_message.text
-                    or message.reply_to_message.caption
-                    or None
+            replied_text = message.reply_to_message.text or None
+            replied_caption = message.reply_to_message.caption or None
+            if (
+                thread_id_str is not None
+                and reply_to_id == thread_id_str
+                and not replied_text
+                and not replied_caption
+            ):
+                # Telegram forum topics can surface the topic starter/root as a
+                # synthetic reply_to_message where message_id == message_thread_id.
+                # That is a routing anchor, not user-selected quote context.  If
+                # we turn it into an unavailable quote marker, the agent chases a
+                # fake old message id (the topic id) and Nicha still doesn't get
+                # the actual quote.  Keep any selected quote already recovered
+                # from Message.quote / external_reply, but discard the anchor id.
+                reply_to_id = None
+            elif not reply_to_text:
+                reply_to_text = replied_text or replied_caption or None
+        if not reply_to_id and external_reply is not None:
+            external_reply_id = getattr(external_reply, "message_id", None)
+            if external_reply_id is not None:
+                reply_to_id = str(external_reply_id)
+            external_chat = getattr(external_reply, "chat", None)
+            external_chat_id = getattr(external_chat, "id", None)
+            if external_chat_id is not None:
+                reply_lookup_chat_id = str(external_chat_id)
+        if reply_to_id and not reply_to_text:
+            reply_to_text = self._lookup_telegram_message_text(reply_lookup_chat_id, reply_to_id)
+            if not reply_to_text:
+                logger.debug(
+                    "[%s] Telegram reply target unavailable; leaving quote context empty: chat=%s thread=%s message_id=%s",
+                    self.name,
+                    reply_lookup_chat_id,
+                    thread_id_str,
+                    reply_to_id,
                 )
                 if not reply_to_text:
                     # Prefer Telegram's native rich-message echo when present;
@@ -7635,6 +8170,21 @@ class TelegramAdapter(BasePlatformAdapter):
                         )
                     except Exception:
                         reply_to_text = None
+
+        inbound_text_or_caption = (
+            getattr(message, "text", None)
+            or getattr(message, "caption", None)
+            or None
+        )
+        self._record_telegram_message(
+            chat_id=str(chat.id),
+            thread_id=thread_id_str,
+            message_id=str(message.message_id),
+            direction="inbound",
+            text_or_caption=inbound_text_or_caption,
+            sender_name=source.user_name,
+            session_id=os.getenv("HERMES_SESSION_ID"),
+        )
 
         # Per-channel/topic ephemeral prompt
         from gateway.platforms.base import resolve_channel_prompt
@@ -7654,6 +8204,7 @@ class TelegramAdapter(BasePlatformAdapter):
             platform_update_id=update_id,
             reply_to_message_id=reply_to_id,
             reply_to_text=reply_to_text,
+            reply_to_is_native_quote=reply_to_is_native_quote,
             auto_skill=topic_skill,
             channel_prompt=_channel_prompt,
             timestamp=message.date,
