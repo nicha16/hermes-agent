@@ -9058,6 +9058,89 @@ def _discard_lockfile_churn(git_cmd, repo_root):
         pass
 
 
+def _normalize_update_pre_gateway_restart_gates(raw):
+    if not raw:
+        return []
+
+    if isinstance(raw, str):
+        entries = [raw]
+    elif isinstance(raw, (list, tuple)):
+        # A single argv list looks like ["scripts/check.sh", "--flag"].
+        # A list of gates looks like ["scripts/check.sh", ["other", "arg"]].
+        if raw and all(not isinstance(item, (list, tuple, dict)) for item in raw):
+            entries = [raw]
+        else:
+            entries = list(raw)
+    else:
+        return []
+
+    commands = []
+    for entry in entries:
+        if isinstance(entry, str):
+            argv = shlex.split(entry)
+        elif isinstance(entry, (list, tuple)):
+            argv = [str(part) for part in entry if str(part).strip()]
+        else:
+            continue
+        if argv:
+            commands.append(argv)
+    return commands
+
+
+def _load_update_pre_gateway_restart_gates():
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+    except Exception as exc:
+        logger.debug("Could not load update gate configuration: %s", exc)
+        return []
+
+    updates = config.get("updates") or {}
+    if not isinstance(updates, dict):
+        return []
+
+    raw = updates.get("pre_gateway_restart_gates")
+    if raw is None:
+        raw = updates.get("pre_gateway_restart_gate")
+    return _normalize_update_pre_gateway_restart_gates(raw)
+
+
+def _resolve_update_gate_argv(project_root: Path, argv: list[str]) -> list[str]:
+    if not argv:
+        return argv
+    first = Path(argv[0]).expanduser()
+    if not first.is_absolute():
+        candidate = project_root / first
+        if candidate.exists():
+            return [str(candidate), *argv[1:]]
+    return [str(first) if first.is_absolute() else argv[0], *argv[1:]]
+
+
+def _run_update_pre_gateway_restart_gates(project_root: Path = PROJECT_ROOT) -> bool:
+    commands = _load_update_pre_gateway_restart_gates()
+    if not commands:
+        return True
+
+    print()
+    print("→ Running pre-gateway-restart update gate(s)...")
+    for argv in commands:
+        resolved = _resolve_update_gate_argv(project_root, argv)
+        print(f"  → {' '.join(resolved)}")
+        try:
+            result = subprocess.run(resolved, cwd=project_root)
+        except FileNotFoundError:
+            print(f"  ✗ Update gate not found: {resolved[0]}")
+            print("  Gateway restart skipped; fix the gate or config before activating this update.")
+            sys.exit(1)
+        if result.returncode != 0:
+            print(f"  ✗ Update gate failed with exit code {result.returncode}")
+            print("  Gateway restart skipped; fix the failing gate before activating this update.")
+            sys.exit(1)
+    print("  ✓ Pre-gateway-restart update gate(s) passed")
+    return True
+
+
 def cmd_update(args):
     """Update Hermes Agent to the latest version.
 
@@ -9948,6 +10031,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as exc:
             # Never let the cron safety net break an otherwise-good update.
             logger.debug("Cron jobs auto-restore check failed: %s", exc)
+
+        _run_update_pre_gateway_restart_gates(PROJECT_ROOT)
 
         print()
         print("✓ Update complete!")

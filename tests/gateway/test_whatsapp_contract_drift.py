@@ -88,5 +88,9 @@ def test_send_message_jid_resolution_present():
     """send_message_tool.py accepts raw WhatsApp JIDs for outbound send."""
     _assert_text_in_file(
         "tools/send_message_tool.py",
-        '"whatsapp" and "@" in target_ref',
+        '_PHONE_PLATFORMS',
+    )
+    _assert_text_in_file(
+        "tools/send_message_tool.py",
+        '_WHATSAPP_JID_RE',
     )

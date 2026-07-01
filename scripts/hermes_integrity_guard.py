@@ -38,6 +38,10 @@ REPO = pathlib.Path(os.environ.get(
 # ── Checks ──────────────────────────────────────────────────────────────
 # FILE_MUST_EXIST:  (relative_path, description)
 # CONTENT_MUST_CONTAIN:  (relative_path, regex_pattern, description)
+# TEST_MUST_PASS:  (relative_test_path, description)
+#   These tests are run with pytest. A failure here means the code they
+#   test was lost even though the test file survived — the guard would
+#   have passed on file-existence alone, giving false confidence.
 
 FILE_MUST_EXIST = [
     # ── add new file-existence checks here ───────────────────────────────
@@ -49,12 +53,16 @@ FILE_MUST_EXIST = [
      "Telegram quote pre-update gate script"),
     ("scripts/whatsapp-bridge/patches/@whiskeysockets+baileys+7.0.0-rc.9.patch",
      "WhatsApp Baileys library patch"),
-    ("tests/tools/test_memory_builtin_writer_gate.py",
-     "Memory writer gate regression test"),
+]
+
+TEST_MUST_PASS = [
+    # ── add new test-run checks here ─────────────────────────────────────
     ("tests/hermes_cli/test_update_pre_restart_gate.py",
      "Pre-restart gate regression test"),
     ("tests/gateway/test_whatsapp_contract_drift.py",
      "WhatsApp contract drift test"),
+    ("tests/tools/test_memory_builtin_writer_gate.py",
+     "Memory writer gate regression test"),
 ]
 
 CONTENT_MUST_CONTAIN = [
@@ -139,6 +147,33 @@ def _silence_file() -> pathlib.Path:
     return REPO / "var" / "integrity_suppressed"
 
 
+def _check_tests_pass(rel_path: str, description: str) -> list[str]:
+    """Run a pytest file, return error lines if any test fails."""
+    import subprocess
+    test_path = REPO / rel_path
+    if not test_path.exists():
+        return [f"  TEST FILE MISSING: {rel_path}  ({description})"]
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", str(test_path), "-q", "--no-header"],
+            cwd=str(REPO),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception as exc:
+        return [f"  TEST RUN FAILED: {rel_path} — {exc}  ({description})"]
+    if result.returncode != 0:
+        # Return the pytest output (last few lines) for diagnosis
+        lines = result.stdout.strip().split("\n")
+        summary = lines[-5:] if len(lines) > 5 else lines
+        return [
+            f"  TEST FAILED: {rel_path}  ({description})",
+            *[f"    {line}" for line in summary],
+        ]
+    return []
+
+
 def main() -> int:
     errors: list[str] = []
 
@@ -147,6 +182,9 @@ def main() -> int:
 
     for rel_path, pattern, description in CONTENT_MUST_CONTAIN:
         errors.extend(_check_content(rel_path, pattern, description))
+
+    for rel_path, description in TEST_MUST_PASS:
+        errors.extend(_check_tests_pass(rel_path, description))
 
     if errors:
         silence = _silence_file()

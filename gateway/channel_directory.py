@@ -8,6 +8,8 @@ action="list" and for resolving human-friendly channel names to numeric IDs.
 
 import json
 import logging
+import os
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -135,7 +137,10 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
         plat_name = plat.value
         if plat_name in _SKIP_SESSION_DISCOVERY or plat_name in platforms:
             continue
-        platforms[plat_name] = _build_from_sessions(plat_name)
+        entries = _build_from_sessions(plat_name)
+        if plat_name == "whatsapp":
+            entries = _merge_whatsapp_contacts(entries)
+        platforms[plat_name] = entries
 
     # Include plugin-registered platforms (dynamic enum members aren't in
     # Platform.__members__, so the loop above misses them).
@@ -143,7 +148,10 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
         from gateway.platform_registry import platform_registry
         for entry in platform_registry.plugin_entries():
             if entry.name not in _SKIP_SESSION_DISCOVERY and entry.name not in platforms:
-                platforms[entry.name] = _build_from_sessions(entry.name)
+                entries = _build_from_sessions(entry.name)
+                if entry.name == "whatsapp":
+                    entries = _merge_whatsapp_contacts(entries)
+                platforms[entry.name] = entries
     except Exception:
         pass
 
@@ -421,3 +429,120 @@ def format_directory_for_display() -> str:
     lines.append('Bare platform name (e.g. "telegram") sends to home channel.')
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# WhatsApp contact discovery from bridge lid-mapping files
+# ---------------------------------------------------------------------------
+
+# Forward mapping files are named lid-mapping-<phone>.json and contain a LID.
+# Reverse files are lid-mapping-<LID>_reverse.json and contain a phone number.
+# Both are plain JSON files with a single string value.
+_FORWARD_LID_RE = re.compile(r"^lid-mapping-(\d{7,15})\.json$")
+_REVERSE_LID_RE = re.compile(r"^lid-mapping-(\d+)_reverse\.json$")
+# Exclude known non-contact JID patterns (status, broadcast, system).
+_NON_CONTACT_JID_PATTERNS = re.compile(
+    r"^status(@broadcast)?$|@broadcast$|@newsletter$", re.IGNORECASE
+)
+
+
+def _merge_whatsapp_contacts(
+    session_entries: List[Dict[str, str]],
+) -> List[Dict[str, str]]:
+    """Merge lid-mapping contacts into session-based WhatsApp entries.
+
+    Session entries take priority (they have display names from pushName).
+    Lid-mapping contacts fill the gap when sessions.json has been rebuilt
+    from scratch after a restart or cutover.
+    """
+    lid_entries = _build_whatsapp_from_lid_mappings()
+    if not lid_entries:
+        return session_entries
+
+    seen_ids = {entry.get("id") for entry in session_entries if entry.get("id")}
+    merged = list(session_entries)
+    for entry in lid_entries:
+        eid = entry.get("id")
+        if eid and eid not in seen_ids:
+            seen_ids.add(eid)
+            merged.append(entry)
+    return merged
+
+
+def _build_whatsapp_from_lid_mappings() -> List[Dict[str, str]]:
+    """Discover WhatsApp contacts from the bridge's lid-mapping session files.
+
+    These files survive gateway restarts and cutovers — they are the durable
+    record of every contact the bridge has resolved a LID for.  Entries from
+    this source are merged into the channel directory so :meth:`send_message`
+    can resolve WhatsApp contacts by JID even when ``sessions.json`` has
+    been rebuilt from scratch.
+    """
+    session_dir = get_hermes_home() / "whatsapp" / "session"
+    if not session_dir.is_dir():
+        return []
+
+    entries: List[Dict[str, str]] = []
+    seen_phones: set = set()
+    seen_lids: set = set()
+
+    try:
+        # Pass 1: reverse files (LID → phone).  These are the most reliable
+        # source — they're only created for LIDs the bridge actively resolved.
+        for filename in os.listdir(session_dir):
+            m = _REVERSE_LID_RE.match(filename)
+            if not m:
+                continue
+            lid = m.group(1)
+            if lid in seen_lids:
+                continue
+            seen_lids.add(lid)
+            filepath = session_dir / filename
+            try:
+                phone = json.loads(filepath.read_text(encoding="utf-8"))
+                if not isinstance(phone, str) or not phone.strip().isdigit():
+                    continue
+                phone = phone.strip()
+            except Exception:
+                continue
+            if phone in seen_phones:
+                continue
+            seen_phones.add(phone)
+            entries.append({
+                "id": f"{lid}@lid",
+                "name": f"+{phone}",
+                "type": "dm",
+            })
+
+        # Pass 2: forward files (phone → LID) for any remaining contacts
+        # not already covered by reverse files.
+        for filename in os.listdir(session_dir):
+            m = _FORWARD_LID_RE.match(filename)
+            if not m:
+                continue
+            phone = m.group(1)
+            if phone in seen_phones:
+                continue
+            seen_phones.add(phone)
+            filepath = session_dir / filename
+            try:
+                lid = json.loads(filepath.read_text(encoding="utf-8"))
+                if not isinstance(lid, str) or not lid.strip():
+                    continue
+                lid = lid.strip()
+            except Exception:
+                continue
+            if _NON_CONTACT_JID_PATTERNS.search(lid):
+                continue
+            if lid in seen_lids:
+                continue
+            seen_lids.add(lid)
+            entries.append({
+                "id": f"{lid}@lid",
+                "name": f"+{phone}",
+                "type": "dm",
+            })
+    except OSError:
+        pass
+
+    return entries

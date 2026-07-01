@@ -7935,6 +7935,341 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    def _whatsapp_inbox_mode_enabled(self) -> bool:
+        try:
+            cfg = self.config.platforms.get(Platform.WHATSAPP)
+        except Exception:
+            cfg = None
+        if cfg is not None:
+            configured = (cfg.extra or {}).get("inbox_mode")
+            if configured is not None:
+                if isinstance(configured, str):
+                    return configured.lower() in ("true", "1", "yes", "on")
+                return bool(configured)
+        return os.getenv("WHATSAPP_INBOX_MODE", "").lower() in ("true", "1", "yes", "on")
+
+    def _build_whatsapp_triage_fallback(self, event: MessageEvent) -> str:
+        source = event.source
+        sender = (
+            (source.user_name if source else None)
+            or (source.chat_name if source else None)
+            or (source.user_id if source else None)
+            or (source.chat_id if source else None)
+            or "Unknown sender"
+        )
+        body = (event.text or "").strip() or "[non-text message]"
+        media_note = ""
+        if getattr(event, "media_urls", None):
+            media_kinds = ", ".join(event.media_types or ["attachment"])
+            media_note = f"\nAttachments: {media_kinds}"
+        return (
+            "## WhatsApp triage\n"
+            f"**From:** {sender}\n"
+            "**Priority:** unknown\n"
+            "**What this is:** New WhatsApp message that needs manual review.\n"
+            "**Needs action:** Review and decide whether to reply.\n"
+            "**Suggested next step:** Open the message details below and decide if a response is needed.\n"
+            "**Draft reply:** None yet.\n\n"
+            f"**Original message:**\n{body}{media_note}"
+        )
+
+    @staticmethod
+    def _extract_json_object(text: str) -> dict[str, Any] | None:
+        raw = (text or "").strip()
+        if not raw:
+            return None
+        candidates = [raw]
+        fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.DOTALL)
+        candidates.extend(fenced)
+        if "{" in raw and "}" in raw:
+            candidates.append(raw[raw.find("{"):raw.rfind("}") + 1])
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except Exception:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
+    def _format_whatsapp_triage_payload(self, event: MessageEvent, payload: dict[str, Any] | None, raw_response: str = "") -> str:
+        source = event.source
+        sender = (
+            (source.user_name if source else None)
+            or (source.chat_name if source else None)
+            or (source.user_id if source else None)
+            or (source.chat_id if source else None)
+            or "Unknown sender"
+        )
+        body = (event.text or "").strip() or "[non-text message]"
+        media_note = ""
+        if getattr(event, "media_urls", None):
+            media_kinds = ", ".join(event.media_types or ["attachment"])
+            media_note = f"\nAttachments: {media_kinds}"
+
+        payload = payload or {}
+        priority = str(payload.get("priority") or "unknown").strip().lower() or "unknown"
+        summary = str(payload.get("summary") or "New WhatsApp message.").strip()
+        action = str(payload.get("action_needed") or "Review manually.").strip()
+        next_step = str(payload.get("next_step") or "Decide whether to reply.").strip()
+        draft_reply = str(payload.get("draft_reply") or "None").strip()
+
+        lines = [
+            "## WhatsApp triage",
+            f"**From:** {sender}",
+            f"**Priority:** {priority}",
+            f"**What this is:** {summary}",
+            f"**Needs action:** {action}",
+            f"**Suggested next step:** {next_step}",
+            f"**Draft reply:** {draft_reply}",
+            "",
+            f"**Original message:**\n{body}{media_note}",
+        ]
+        if raw_response and not payload:
+            lines.extend(["", f"**Raw triage output:**\n{raw_response.strip()}"])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _extract_whatsapp_triage_priority(triaged_text: str) -> str:
+        raw = triaged_text or ""
+        match = re.search(r"\*\*Priority:\*\*\s*([A-Za-z]+)", raw, flags=re.IGNORECASE)
+        if not match:
+            match = re.search(r"\bPriority:\s*([A-Za-z]+)", raw, flags=re.IGNORECASE)
+        if not match:
+            return "unknown"
+        return match.group(1).strip().lower()
+
+    @staticmethod
+    def _normalize_whatsapp_context_key(value: str | None) -> str:
+        raw = str(value or "").strip().lower()
+        if raw.endswith("@s.whatsapp.net"):
+            return raw[:-15]
+        if raw.endswith("@lid"):
+            return raw[:-4]
+        return raw
+
+    @staticmethod
+    def _parse_whatsapp_triage_session(path: Path) -> dict[str, Any] | None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            return None
+        user_prompt = None
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "user" and isinstance(msg.get("content"), str):
+                text = msg["content"]
+                if "Sender:" in text and "Message text:" in text:
+                    user_prompt = text
+                    break
+        if not user_prompt:
+            return None
+
+        sender_match = re.search(r"^Sender:\s*(.+)$", user_prompt, flags=re.MULTILINE)
+        chat_match = re.search(r"^Chat ID:\s*(.+)$", user_prompt, flags=re.MULTILINE)
+        message_match = re.search(r"Message text:\n(.*?)\n\nAttachments:\n", user_prompt, flags=re.DOTALL)
+        if not sender_match or not message_match:
+            return None
+
+        return {
+            "sender": sender_match.group(1).strip(),
+            "chat_id": chat_match.group(1).strip() if chat_match else "",
+            "message_text": message_match.group(1).strip(),
+            "sort_key": str(payload.get("session_start") or payload.get("last_updated") or path.name),
+        }
+
+    def _load_recent_whatsapp_triage_context(self, source: SessionSource | None, limit: int = 6) -> list[dict[str, str]]:
+        if not source or source.platform != Platform.WHATSAPP:
+            return []
+
+        sessions_dir = _hermes_home / "sessions"
+        if not sessions_dir.exists():
+            return []
+
+        current_sender = str(source.user_name or source.chat_name or "").strip().casefold()
+        current_chat_key = self._normalize_whatsapp_context_key(source.chat_id or source.user_id)
+        matches: list[dict[str, str]] = []
+
+        for path in sessions_dir.glob("session_whatsapp_triage_*.json"):
+            parsed = self._parse_whatsapp_triage_session(path)
+            if not parsed:
+                continue
+            session_chat_key = self._normalize_whatsapp_context_key(parsed.get("chat_id"))
+            session_sender = str(parsed.get("sender") or "").strip().casefold()
+            same_chat = bool(current_chat_key and session_chat_key and current_chat_key == session_chat_key)
+            same_sender = bool(current_sender and session_sender and current_sender == session_sender)
+            if not same_chat and not same_sender:
+                continue
+            message_text = str(parsed.get("message_text") or "").strip()
+            if not message_text:
+                continue
+            matches.append({
+                "sender": str(parsed.get("sender") or "Unknown sender").strip(),
+                "message_text": message_text,
+                "sort_key": str(parsed.get("sort_key") or path.name),
+            })
+
+        matches.sort(key=lambda item: item.get("sort_key", ""))
+        if limit > 0:
+            matches = matches[-limit:]
+        return matches
+
+    def _build_whatsapp_triage_prompt(self, event: MessageEvent) -> str:
+        source = event.source
+        body = (event.text or "").strip() or "[non-text message]"
+        media_lines = []
+        if getattr(event, "media_urls", None):
+            media_types = event.media_types or []
+            for idx, path in enumerate(event.media_urls):
+                kind = media_types[idx] if idx < len(media_types) else "attachment"
+                media_lines.append(f"- {kind}: {path}")
+        media_block = "\n".join(media_lines) if media_lines else "- none"
+
+        history = self._load_recent_whatsapp_triage_context(source)
+        history_block = "- none"
+        if history:
+            history_block = "\n".join(
+                f"- {item['sender']}: {item['message_text']}" for item in history
+            )
+
+        return (
+            "You are triaging a WhatsApp message for the user. Treat it like an email triage assistant. "
+            "Do not reply to the sender. Return JSON only with keys: priority, summary, action_needed, next_step, draft_reply. "
+            "Keep each field concise and practical. priority must be one of: low, medium, high, urgent.\n\n"
+            f"Sender: {source.user_name or source.chat_name or source.user_id or source.chat_id}\n"
+            f"Chat ID: {source.chat_id}\n"
+            f"Recent thread context (oldest to newest):\n{history_block}\n\n"
+            f"Message text:\n{body}\n\n"
+            f"Attachments:\n{media_block}\n"
+        )
+
+    async def _triage_whatsapp_inbox_event(self, event: MessageEvent) -> str:
+        from run_agent import AIAgent
+        source = event.source
+        if not source:
+            return self._build_whatsapp_triage_fallback(event)
+
+        user_config = _load_gateway_config()
+        telegram_home = self.config.get_home_channel(Platform.TELEGRAM) if self.config else None
+        triage_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id=str(telegram_home.chat_id) if telegram_home else "whatsapp-inbox",
+            chat_id=str(telegram_home.chat_id) if telegram_home else "whatsapp-inbox",
+            user_name="WhatsApp inbox triage",
+            chat_type="dm",
+        )
+        model, runtime_kwargs = self._resolve_session_agent_runtime(
+            source=triage_source,
+            session_key=None,
+            user_config=user_config,
+        )
+        if not runtime_kwargs.get("api_key"):
+            return self._build_whatsapp_triage_fallback(event)
+
+        pr = getattr(self, "_provider_routing", self._load_provider_routing())
+        reasoning_config = self._load_reasoning_config()
+        service_tier = getattr(self, "_service_tier", self._load_service_tier())
+        fallback_model = getattr(self, "_fallback_model", self._load_fallback_model())
+        turn_route = self._resolve_turn_agent_config(event.text or "[non-text message]", model, runtime_kwargs)
+
+        prompt = self._build_whatsapp_triage_prompt(event)
+
+        def run_sync():
+            agent = AIAgent(
+                model=turn_route["model"],
+                **turn_route["runtime"],
+                max_iterations=1,
+                quiet_mode=True,
+                verbose_logging=False,
+                enabled_toolsets=[],
+                reasoning_config=reasoning_config,
+                service_tier=service_tier,
+                request_overrides=turn_route.get("request_overrides"),
+                providers_allowed=pr.get("only"),
+                providers_ignored=pr.get("ignore"),
+                providers_order=pr.get("order"),
+                provider_sort=pr.get("sort"),
+                provider_require_parameters=pr.get("require_parameters", False),
+                provider_data_collection=pr.get("data_collection"),
+                session_id=f"whatsapp_triage_{event.message_id or int(time.time())}",
+                platform="telegram",
+                user_id=str(triage_source.user_id),
+                session_db=None,
+                fallback_model=fallback_model,
+            )
+            try:
+                return agent.run_conversation(user_message=prompt, task_id=f"whatsapp_triage_{event.message_id or int(time.time())}")
+            finally:
+                try:
+                    self._cleanup_agent_resources(agent)
+                except Exception:
+                    pass
+
+        try:
+            result = await self._run_in_executor_with_context(run_sync)
+        except Exception as exc:
+            logger.warning("WhatsApp inbox triage failed for %s: %s", source.chat_id, exc)
+            return self._build_whatsapp_triage_fallback(event)
+
+        raw_response = (result or {}).get("final_response") or ""
+        payload = self._extract_json_object(raw_response)
+        return self._format_whatsapp_triage_payload(event, payload, raw_response=raw_response)
+
+    async def _forward_whatsapp_inbox_event(self, event: MessageEvent) -> bool:
+        source = event.source
+        if (
+            not source
+            or source.platform != Platform.WHATSAPP
+            or getattr(event, "internal", False)
+            or not self._whatsapp_inbox_mode_enabled()
+            or source.chat_type not in {"dm", "group"}
+        ):
+            return False
+
+        telegram_home = self.config.get_home_channel(Platform.TELEGRAM) if self.config else None
+        telegram_adapter = self.adapters.get(Platform.TELEGRAM)
+        if not telegram_home or not telegram_adapter:
+            logger.warning(
+                "WhatsApp inbox mode enabled but no Telegram home channel is configured; suppressing WhatsApp reply for %s",
+                source.chat_id,
+            )
+            return True
+
+        sender = source.user_name or source.chat_name or source.user_id or source.chat_id or "Unknown sender"
+        try:
+            triaged = await self._triage_whatsapp_inbox_event(event)
+            priority = self._extract_whatsapp_triage_priority(triaged)
+            if priority not in {"urgent", "high"}:
+                logger.info(
+                    "Suppressing WhatsApp inbox triage from %s (%s) because priority=%s is not real-time",
+                    sender,
+                    source.chat_id,
+                    priority,
+                )
+                return True
+            send_result = await telegram_adapter.send(telegram_home.chat_id, triaged)
+            if getattr(send_result, "success", True) is False:
+                logger.warning(
+                    "Failed forwarding WhatsApp inbox triage to Telegram home for %s: %s",
+                    source.chat_id,
+                    getattr(send_result, "error", "unknown send error"),
+                )
+                return True
+            logger.info(
+                "Triaged WhatsApp inbox event from %s (%s) to Telegram home channel %s",
+                sender,
+                source.chat_id,
+                telegram_home.chat_id,
+            )
+        except Exception as e:
+            logger.warning("Failed forwarding WhatsApp inbox triage to Telegram home for %s: %s", source.chat_id, e)
+            return True
+        return True
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -8010,6 +8345,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
                 if _action == "allow":
                     break
+
+        if await self._forward_whatsapp_inbox_event(event):
+            return None
 
         if is_internal:
             pass
