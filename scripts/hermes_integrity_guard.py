@@ -2,12 +2,27 @@
 """
 hermes_integrity_guard.py — Verify critical local patches survived the Hermes update.
 
-Designed to be run:
-  1. After any `hermes update` or git pull / cutover operation
-  2. Periodically via cron (silent unless a check fails)
+███ REGISTERING NEW PATCHES — READ THIS ███
 
-Exit 0 = all checks pass (or silenced by configured suppression).
-Exit 1 = one or more checks failed (and it will print details to stdout).
+Whenever you (Keira) apply a local-only patch to the Hermes source tree,
+add its file path and a unique content marker below BEFORE committing.
+Two sections:
+
+  FILE_MUST_EXIST        — files that must be physically present
+  CONTENT_MUST_CONTAIN    — files that must contain a specific pattern
+
+Each entry is (relative_path, regex_or_None, human_description).
+Choose a regex that is:
+  • Specific to your patch (not something upstream also has)
+  • Stable across minor edits (not line numbers)
+  • A literal string if possible (e.g., a unique function name or comment)
+
+Use the ``# ── add new checks here ──`` markers as insertion points.
+Failure mode: any unregistered patch will be silently lost in the next
+update.  The post-merge hook runs this automatically after every
+``hermes update`` / ``git pull``.
+
+Exit 0 = passes.  Exit 1 = failures (reported to stdout during update).
 """
 
 import os
@@ -25,6 +40,7 @@ REPO = pathlib.Path(os.environ.get(
 # CONTENT_MUST_CONTAIN:  (relative_path, regex_pattern, description)
 
 FILE_MUST_EXIST = [
+    # ── add new file-existence checks here ───────────────────────────────
     ("plugins/model-providers/kimi-oauth/__init__.py",
      "Kimi OAuth provider profile"),
     ("plugins/model-providers/kimi-oauth/plugin.yaml",
@@ -42,6 +58,8 @@ FILE_MUST_EXIST = [
 ]
 
 CONTENT_MUST_CONTAIN = [
+    # ── add new content checks here ──────────────────────────────────────
+    # Format: ("relative/path.py", r"unique_regex_pattern", "description"),
     # MCP reconnect retry — continuous retry, not park
     ("tools/mcp_tool.py",
      r"self\._mark_connected\(\)",
