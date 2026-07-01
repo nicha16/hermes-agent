@@ -63,6 +63,8 @@ TEST_MUST_PASS = [
      "WhatsApp contract drift test"),
     ("tests/tools/test_memory_builtin_writer_gate.py",
      "Memory writer gate regression test"),
+    ("tests/hermes_cli/test_model_switch_session_scoped.py",
+     "Session-scoped /model default regression test"),
 ]
 
 CONTENT_MUST_CONTAIN = [
@@ -105,6 +107,10 @@ CONTENT_MUST_CONTAIN = [
     ("plugins/platforms/telegram/adapter.py",
      r"streaming",
      "Telegram streaming opt-in"),
+    # Session-scoped /model default (Nicha policy 2026-07-01) — upstream ships True
+    ("hermes_cli/model_switch.py",
+     r'persist_switch_by_default", False',
+     "session-scoped /model default (built-in False)"),
     # ── add new content checks above this line ──────────────────────────────
     # ── cross-file dataclass contract ───────────────────────────────────────
     # reply_to_is_native_quote must exist in base.py MessageEvent dataclass
