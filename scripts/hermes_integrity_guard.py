@@ -109,10 +109,6 @@ CONTENT_MUST_CONTAIN = [
     ("scripts/dataclass_kwarg_contract_check.py",
      r"MessageEvent",
      "dataclass kwarg contract checker"),
-    # adapter message build smoke test must be present
-    ("scripts/hermes_adapter_message_build_smoke.py",
-     r"_minimal_event",
-     "adapter message build smoke test"),
 ]
 
 

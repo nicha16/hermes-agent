@@ -23,8 +23,7 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 
 def _fields_of(dataclass_path: str, class_name: str) -> set[str]:
     """Return the field names of a dataclass by importing it."""
-    module_path, _ = dataclass_path.rsplit("/", 1)
-    module_name = module_path.replace("/", ".").rstrip(".py")
+    module_name = pathlib.Path(dataclass_path).with_suffix("").as_posix().replace("/", ".")
     module_name = module_name.replace("plugins.", "hermes_cli.") \
         if module_name.startswith("plugins.") else module_name
     try:
