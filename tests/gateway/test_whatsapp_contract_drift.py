@@ -94,3 +94,18 @@ def test_send_message_jid_resolution_present():
         "tools/send_message_tool.py",
         '_WHATSAPP_JID_RE',
     )
+
+
+def test_gateway_triage_calibration_prioritizes_same_day_personal_coordination():
+    """The triage prompt makes same-day personal coordination visible to the user."""
+    f = "gateway/run.py"
+    text = (REPO / f).read_text(errors="replace")
+    expected_rules = (
+        "CALIBRATION RULES (overrides general judgment)",
+        "today', 'tonight', 'this evening'",
+        "within 4 hours of the proposed time",
+        "known contact, the message is personal",
+        "over-escalating time-sensitive social coordination",
+    )
+    for rule in expected_rules:
+        assert rule in text, f"Missing same-day triage calibration in {f}: {rule!r}"
