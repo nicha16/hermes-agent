@@ -51,8 +51,10 @@ FILE_MUST_EXIST = [
      "Kimi OAuth plugin definition"),
     ("scripts/check_telegram_quote_gate.sh",
      "Telegram quote pre-update gate script"),
-    ("scripts/whatsapp-bridge/patches/@whiskeysockets+baileys+7.0.0-rc.9.patch",
-     "WhatsApp Baileys library patch"),
+    ("scripts/whatsapp-bridge/patches/@whiskeysockets+baileys+7.0.0-rc13.patch",
+     "WhatsApp Baileys rc13 atomic-auth patch"),
+    ("scripts/whatsapp-bridge/atomic-auth-write.test.mjs",
+     "WhatsApp Baileys atomic-auth regression test"),
 ]
 
 TEST_MUST_PASS = [
@@ -111,6 +113,13 @@ CONTENT_MUST_CONTAIN = [
     ("hermes_cli/model_switch.py",
      r'persist_switch_by_default", False',
      "session-scoped /model default (built-in False)"),
+    # WhatsApp Baileys auth-state durability
+    ("scripts/whatsapp-bridge/package.json",
+     r'"postinstall": "patch-package"',
+     "Baileys atomic-auth patch is re-applied after npm install"),
+    ("scripts/whatsapp-bridge/patches/@whiskeysockets+baileys+7.0.0-rc13.patch",
+     r"await rename\(tmpPath, filePath\);",
+     "Baileys auth writes atomically replace the credentials file"),
     # ── add new content checks above this line ──────────────────────────────
     # ── cross-file dataclass contract ───────────────────────────────────────
     # reply_to_is_native_quote must exist in base.py MessageEvent dataclass
