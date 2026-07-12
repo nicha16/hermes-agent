@@ -100,11 +100,8 @@ const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n──────────
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
   : process.env.WHATSAPP_REPLY_PREFIX.replace(/\\n/g, '\n');
-const OFFLINE_PRESENCE_INTERVAL_MS = Math.max(
-  15000,
-  parseInt(process.env.WHATSAPP_OFFLINE_PRESENCE_INTERVAL_MS || '60000', 10) || 60000,
-);
-let offlinePresenceTimer = null;
+const OFFLINE_PRESENCE_DELAYS_MS = [0, 5000, 30000];
+let offlinePresenceTimers = [];
 const MAX_MESSAGE_LENGTH = parseInt(process.env.WHATSAPP_MAX_MESSAGE_LENGTH || '4096', 10);
 const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10);
 // Per-call timeout for sock.sendMessage(). Baileys occasionally hangs forever
@@ -285,18 +282,18 @@ function setOfflinePresence(reason = '') {
   });
 }
 
-function startOfflinePresenceLoop() {
-  if (offlinePresenceTimer) clearInterval(offlinePresenceTimer);
-  setOfflinePresence('connected');
-  offlinePresenceTimer = setInterval(() => {
-    setOfflinePresence('periodic');
-  }, OFFLINE_PRESENCE_INTERVAL_MS);
-  if (typeof offlinePresenceTimer.unref === 'function') offlinePresenceTimer.unref();
+function scheduleOfflinePresenceReset() {
+  clearOfflinePresenceReset();
+  offlinePresenceTimers = OFFLINE_PRESENCE_DELAYS_MS.map((delayMs) => {
+    const timer = setTimeout(() => setOfflinePresence(`connected_${delayMs}ms`), delayMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    return timer;
+  });
 }
 
-function stopOfflinePresenceLoop() {
-  if (offlinePresenceTimer) clearInterval(offlinePresenceTimer);
-  offlinePresenceTimer = null;
+function clearOfflinePresenceReset() {
+  for (const timer of offlinePresenceTimers) clearTimeout(timer);
+  offlinePresenceTimers = [];
 }
 
 async function startSocket() {
@@ -334,7 +331,7 @@ async function startSocket() {
     if (connection === 'close') {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
       connectionState = 'disconnected';
-      stopOfflinePresenceLoop();
+      clearOfflinePresenceReset();
 
       if (reason === DisconnectReason.loggedOut) {
         console.log('❌ Logged out. Delete session and restart to re-authenticate.');
@@ -351,7 +348,7 @@ async function startSocket() {
     } else if (connection === 'open') {
       connectionState = 'connected';
       console.log('✅ WhatsApp connected!');
-      startOfflinePresenceLoop();
+      scheduleOfflinePresenceReset();
       if (PAIR_ONLY) {
         console.log('✅ Pairing complete. Credentials saved.');
         // Give Baileys a moment to flush creds, then exit cleanly

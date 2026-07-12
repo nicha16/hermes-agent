@@ -46,14 +46,16 @@ def test_bridge_inbox_wiring_present():
     )
 
 
-def test_bridge_reasserts_unavailable_presence_without_typing():
-    """The companion bridge stays unavailable while preserving inbox triage."""
+def test_bridge_uses_bounded_unavailable_presence_reset_without_typing():
+    """Presence resets converge after connect instead of polling forever."""
     f = "scripts/whatsapp-bridge/bridge.js"
     text = (REPO / f).read_text(errors="replace")
     assert "markOnlineOnConnect: false" in text
     assert "sendPresenceUpdate('unavailable')" in text
-    assert "startOfflinePresenceLoop()" in text
-    assert "stopOfflinePresenceLoop()" in text
+    assert "scheduleOfflinePresenceReset()" in text
+    assert "clearOfflinePresenceReset()" in text
+    assert "OFFLINE_PRESENCE_DELAYS_MS = [0, 5000, 30000]" in text
+    assert "setInterval(" not in text
     assert "sendPresenceUpdate('composing'" not in text
 
 
