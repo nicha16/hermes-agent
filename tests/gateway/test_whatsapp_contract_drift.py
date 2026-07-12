@@ -46,6 +46,17 @@ def test_bridge_inbox_wiring_present():
     )
 
 
+def test_bridge_reasserts_unavailable_presence_without_typing():
+    """The companion bridge stays unavailable while preserving inbox triage."""
+    f = "scripts/whatsapp-bridge/bridge.js"
+    text = (REPO / f).read_text(errors="replace")
+    assert "markOnlineOnConnect: false" in text
+    assert "sendPresenceUpdate('unavailable')" in text
+    assert "startOfflinePresenceLoop()" in text
+    assert "stopOfflinePresenceLoop()" in text
+    assert "sendPresenceUpdate('composing'" not in text
+
+
 def test_gateway_inbox_triage_present():
     """Python gateway/run.py has inbox forwarding + triage functions."""
     f = "gateway/run.py"
