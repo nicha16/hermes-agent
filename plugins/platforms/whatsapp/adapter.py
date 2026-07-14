@@ -617,6 +617,16 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             inbox_mode = self.config.extra.get("inbox_mode")
             if inbox_mode is not None and "WHATSAPP_INBOX_MODE" not in bridge_env:
                 bridge_env["WHATSAPP_INBOX_MODE"] = str(inbox_mode).lower()
+            # Sweep mode: controlled connect/disconnect for native iPhone push.
+            # When set > 0, bridge connects, sweeps pending messages, disconnects,
+            # and repeats on the interval. Between sweeps, WhatsApp routes push
+            # to the iPhone because no active companion is connected.
+            sweep_interval_ms = self.config.extra.get("sweep_interval_ms")
+            if sweep_interval_ms is not None:
+                bridge_env["WHATSAPP_SWEEP_INTERVAL_MS"] = str(sweep_interval_ms)
+            sweep_window_ms = self.config.extra.get("sweep_window_ms")
+            if sweep_window_ms is not None:
+                bridge_env["WHATSAPP_SWEEP_WINDOW_MS"] = str(sweep_window_ms)
             # Pass the profile-aware cache directories so the bridge writes
             # media where the Python side reads it. Without these the bridge
             # hardcodes ~/.hermes/{image,audio,document}_cache, which diverges
