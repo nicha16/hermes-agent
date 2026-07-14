@@ -14,12 +14,18 @@ def test_sweep_mode_disabled_by_default():
 
 
 def test_sweep_mode_gates_connection_lifecycle():
-    """When sweep is enabled, open schedules a window and close uses sweep interval."""
+    """Only locally initiated sweep closes wait for the sweep interval."""
     source = BRIDGE.read_text()
-    assert "SWEEP_INTERVAL_MS > 0 ? SWEEP_INTERVAL_MS" in source
+    assert "let intentionalSweepDisconnect = false" in source
+    assert "const wasIntentionalSweepDisconnect = intentionalSweepDisconnect" in source
+    assert "} else if (wasIntentionalSweepDisconnect)" in source
+    assert "↻ Sweep complete. Reconnecting in ${SWEEP_INTERVAL_MS}ms" in source
+    # Remote 428 and other transport closes retain the original quick recovery.
+    assert "setTimeout(startSocket, reason === 515 ? 1000 : 3000)" in source
     assert "sweepMessagesSeen = false" in source
     assert "sweepTimer = setTimeout" in source
     assert "clearSweepTimer()" in source
+    assert source.count("intentionalSweepDisconnect = true") == 2
     assert "sock.end(new Boom('Sweep window complete'" in source
 
 

@@ -112,6 +112,9 @@ const SWEEP_INTERVAL_MS = parseInt(getArg('sweep-interval', process.env.WHATSAPP
 const SWEEP_WINDOW_MS   = parseInt(process.env.WHATSAPP_SWEEP_WINDOW_MS || '5000', 10);
 let sweepTimer = null;
 let sweepMessagesSeen = false;
+// True only for the locally initiated close at the end of a sweep. A remote
+// 428 has the same status code, so it must retain the normal fast reconnect.
+let intentionalSweepDisconnect = false;
 
 function clearSweepTimer() {
   if (sweepTimer) { clearTimeout(sweepTimer); sweepTimer = null; }
@@ -344,6 +347,8 @@ async function startSocket() {
 
     if (connection === 'close') {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      const wasIntentionalSweepDisconnect = intentionalSweepDisconnect;
+      intentionalSweepDisconnect = false;
       connectionState = 'disconnected';
       clearOfflinePresenceReset();
       clearSweepTimer();
@@ -351,15 +356,19 @@ async function startSocket() {
       if (reason === DisconnectReason.loggedOut) {
         console.log('❌ Logged out. Delete session and restart to re-authenticate.');
         process.exit(1);
+      } else if (wasIntentionalSweepDisconnect) {
+        console.log(`↻ Sweep complete. Reconnecting in ${SWEEP_INTERVAL_MS}ms...`);
+        setTimeout(startSocket, SWEEP_INTERVAL_MS);
       } else {
-        // 515 = restart requested (common after pairing). Always reconnect.
+        // A server/network close must recover promptly. It can carry the same
+        // 428 status code as the locally initiated sweep close, hence the
+        // explicit intent flag above rather than classification by status code.
         if (reason === 515) {
           console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
         } else {
           console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
         }
-        const delay = SWEEP_INTERVAL_MS > 0 ? SWEEP_INTERVAL_MS : (reason === 515 ? 1000 : 3000);
-        setTimeout(startSocket, delay);
+        setTimeout(startSocket, reason === 515 ? 1000 : 3000);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
@@ -374,6 +383,7 @@ async function startSocket() {
             console.log('⚠️  Sweep window expired with no messages. Disconnecting.');
           }
           if (sock && connectionState === 'connected') {
+            intentionalSweepDisconnect = true;
             sock.end(new Boom('Sweep window complete', { statusCode: 428 }));
           }
         }, SWEEP_WINDOW_MS);
@@ -400,6 +410,7 @@ async function startSocket() {
       clearSweepTimer();
       sweepTimer = setTimeout(() => {
         if (sock && connectionState === 'connected') {
+          intentionalSweepDisconnect = true;
           sock.end(new Boom('Sweep window complete', { statusCode: 428 }));
         }
       }, SWEEP_WINDOW_MS);
