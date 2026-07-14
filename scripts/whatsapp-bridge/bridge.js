@@ -102,6 +102,20 @@ const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   : process.env.WHATSAPP_REPLY_PREFIX.replace(/\\n/g, '\n');
 const OFFLINE_PRESENCE_DELAYS_MS = [0, 5000, 30000];
 let offlinePresenceTimers = [];
+
+// --- Sweep mode: connect → process pending → disconnect → repeat.
+//     Between sweeps there is no active WhatsApp companion, so iPhone
+//     native push works naturally.  Hermes triage is bounded to at most
+//     SWEEP_INTERVAL_MS + SWEEP_WINDOW_MS of latency.  Set to 0 (default)
+//     for the original always-connected behaviour. ---
+const SWEEP_INTERVAL_MS = parseInt(getArg('sweep-interval', process.env.WHATSAPP_SWEEP_INTERVAL_MS || '0'), 10);
+const SWEEP_WINDOW_MS   = parseInt(process.env.WHATSAPP_SWEEP_WINDOW_MS || '5000', 10);
+let sweepTimer = null;
+let sweepMessagesSeen = false;
+
+function clearSweepTimer() {
+  if (sweepTimer) { clearTimeout(sweepTimer); sweepTimer = null; }
+}
 const MAX_MESSAGE_LENGTH = parseInt(process.env.WHATSAPP_MAX_MESSAGE_LENGTH || '4096', 10);
 const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10);
 // Per-call timeout for sock.sendMessage(). Baileys occasionally hangs forever
@@ -332,6 +346,7 @@ async function startSocket() {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
       connectionState = 'disconnected';
       clearOfflinePresenceReset();
+      clearSweepTimer();
 
       if (reason === DisconnectReason.loggedOut) {
         console.log('❌ Logged out. Delete session and restart to re-authenticate.');
@@ -343,12 +358,28 @@ async function startSocket() {
         } else {
           console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
         }
-        setTimeout(startSocket, reason === 515 ? 1000 : 3000);
+        const delay = SWEEP_INTERVAL_MS > 0 ? SWEEP_INTERVAL_MS : (reason === 515 ? 1000 : 3000);
+        setTimeout(startSocket, delay);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
+      sweepMessagesSeen = false;
       console.log('✅ WhatsApp connected!');
-      scheduleOfflinePresenceReset();
+      if (SWEEP_INTERVAL_MS > 0) {
+        // Sweep mode: stay connected just long enough to receive pending
+        // messages, then disconnect so iPhone push resumes between sweeps.
+        clearSweepTimer();
+        sweepTimer = setTimeout(() => {
+          if (!sweepMessagesSeen) {
+            console.log('⚠️  Sweep window expired with no messages. Disconnecting.');
+          }
+          if (sock && connectionState === 'connected') {
+            sock.end(new Boom('Sweep window complete', { statusCode: 428 }));
+          }
+        }, SWEEP_WINDOW_MS);
+      } else {
+        scheduleOfflinePresenceReset();
+      }
       if (PAIR_ONLY) {
         console.log('✅ Pairing complete. Credentials saved.');
         // Give Baileys a moment to flush creds, then exit cleanly
@@ -361,6 +392,18 @@ async function startSocket() {
     // In self-chat mode, your own messages commonly arrive as 'append' rather
     // than 'notify'. Accept both and filter agent echo-backs below.
     if (type !== 'notify' && type !== 'append') return;
+
+    // In sweep mode, extend the window when messages are still arriving so
+    // we don't disconnect mid-burst. Reset the sweep timer on each batch.
+    if (SWEEP_INTERVAL_MS > 0 && messages.some(m => m.message && !m.key.fromMe)) {
+      sweepMessagesSeen = true;
+      clearSweepTimer();
+      sweepTimer = setTimeout(() => {
+        if (sock && connectionState === 'connected') {
+          sock.end(new Boom('Sweep window complete', { statusCode: 428 }));
+        }
+      }, SWEEP_WINDOW_MS);
+    }
 
     const botIds = Array.from(new Set([
       normalizeWhatsAppId(sock.user?.id),
